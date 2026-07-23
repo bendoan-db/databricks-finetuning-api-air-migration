@@ -77,3 +77,5 @@ spark-warehouse/
 *.log
 *.tmp
 *.temp
+
+migrate/output

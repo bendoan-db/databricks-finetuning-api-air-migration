@@ -13,15 +13,20 @@ Read `migrate/output/migration-manifest.yaml`. If it is absent or stale, use `ai
 
 ## Choose migration semantics
 
-Select exactly one mode and state why:
+Read `source.use_existing_weights` from the manifest before selecting the mode:
+
+- `true`: require `mode: continue`. Initialize from the exact configured UC version after materialization. State prominently that this further trains the legacy model and is not reproduction.
+- `false`: require `mode: retrain`. Initialize from the recovered original base model, preferring an exact portable `system.ai` match and otherwise using Hugging Face.
+
+Do not override this flag with a heuristic. Select the corresponding mode and state why:
 
 - `retrain`: Start from the original base model and reproduce the legacy workflow. Default for migrating the training process and pursuing parity.
 - `continue`: Start from portable legacy fine-tuned weights and train further. State prominently that this changes the model and is not reproduction.
 - `repackage`: Register portable existing weights without training. State prominently that this is artifact migration, not an AI Runtime training migration.
 
-Do not silently substitute `continue` when the original base model or dataset is unavailable.
+Do not silently substitute `continue` when `use_existing_weights` is false and the original base model or dataset is unavailable.
 
-For `continue`, require portable full Hugging Face weights and a tokenizer. Select a writable UC Volume destination and set `materialization.status: required`; `air-migrate-materialize-uc-model` must complete before generation. Do not point the training plan directly at a `models:/` URI.
+Use [the model-source resolution contract](../air-migrate-materialize-uc-model/references/model-source-resolution.md). For `continue`, require portable full Hugging Face weights and a tokenizer from the configured UC model. For retraining, query `system.ai` for the recovered base model and use it only if an exact portable match exists; otherwise retain the Hugging Face ID. Set `materialization.status: required` for either UC source and `not_required` for Hugging Face. Do not point the training plan directly at a `models:/` URI.
 
 ## Select the recipe
 
@@ -45,7 +50,7 @@ Use `none` only with `mode: repackage`, because that path does not create a trai
 4. Derive micro-batch size and gradient accumulation from GPU capacity while preserving the effective batch size.
 5. Define GPU count/type, runtime version, dependency pins, distributed settings, checkpoint cadence, resume behavior, final artifact format, MLflow experiment, UC Volume paths, and target model registration.
 6. Document every intentional divergence and its expected fidelity impact.
-7. Define acceptance gates before generation: static checks, smoke training, metric thresholds, behavioral evaluation, artifact checks, and target registration checks.
+7. Define acceptance gates before generation: static checks, smoke training, metric thresholds, behavioral evaluation, artifact checks, and target registration checks. Include `assistant_response_token_accuracy` on the immutable evaluation JSONL, its maximum allowed absolute regression from the configured legacy model, and a requirement for equivalent tokenizer/chat serialization. If no defensible regression threshold exists, explicitly make this a measurement-only criterion.
 
 ## Output
 
@@ -60,7 +65,9 @@ plan:
   recipe: axolotl_full_fsdp
   template: air_templates/axolotl_full_fsdp
   input_model:
-    source: original_base_model  # original_base_model | materialized_uc_model
+    use_existing_weights: false
+    source: hugging_face  # materialized_uc_model | materialized_system_ai | hugging_face
+    source_model_uri: null
     model_path: meta-llama/Llama-3.1-8B-Instruct
     tokenizer_path: null
   compute:
@@ -74,10 +81,15 @@ plan:
   intentional_divergences: []
   assumptions: []
   risks: []
-  acceptance_criteria: {}
+  acceptance_criteria:
+    token_accuracy:
+      metric: assistant_response_token_accuracy
+      evaluation_dataset_uri: /Volumes/catalog/schema/volume/eval.jsonl
+      maximum_absolute_regression: 0.01
+      require_equivalent_tokenization: true
 ```
 
-For `mode: continue`, set `input_model.source: materialized_uc_model`, record the intended Volume destination, and leave `model_path` and `tokenizer_path` pending until materialization succeeds. For `retrain`, set `materialization.status: not_required`.
+For `mode: continue`, set `input_model.source: materialized_uc_model`, record the configured source URI and intended Volume destination, and leave `model_path` and `tokenizer_path` pending until materialization succeeds. For retraining from `system.ai`, use `materialized_system_ai` with its pinned URI and paths. For retraining from Hugging Face, use `hugging_face`, retain the recovered model ID, and set `materialization.status: not_required`.
 
 Set `materialization.status`, `generation.status`, and `validation.status` to `stale` when an existing plan materially changes their inputs.
 

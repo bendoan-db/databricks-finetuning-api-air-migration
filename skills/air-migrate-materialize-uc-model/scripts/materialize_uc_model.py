@@ -67,6 +67,22 @@ def reference_from_config(config_path: Path) -> ModelReference:
     return ModelReference(f"{catalog}.{schema}.{model}", version)
 
 
+def use_existing_weights_from_config(config_path: Path) -> bool:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required when using --config") from exc
+
+    with config_path.expanduser().open("r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    if not isinstance(payload, dict) or not isinstance(payload.get("source"), dict):
+        raise ValueError(f"Expected a source mapping in {config_path}")
+    value = payload["source"].get("use_existing_weights")
+    if not isinstance(value, bool):
+        raise ValueError("source.use_existing_weights must be true or false")
+    return value
+
+
 def reference_from_uri(model_uri: str) -> ModelReference:
     match = MODEL_URI_PATTERN.fullmatch(model_uri.strip())
     if match is None:
@@ -294,6 +310,7 @@ def materialize(
     reference: ModelReference,
     output_dir: Path,
     *,
+    purpose: str = "continue_training",
     registry_uri: str = "databricks-uc",
     artifact_uri: str | None = None,
     checkpoint_subpath: str | None = None,
@@ -302,6 +319,14 @@ def materialize(
     require_volume: bool = False,
     mlflow_module: Any | None = None,
 ) -> dict[str, Any]:
+    if purpose not in {
+        "base_model_initialization",
+        "continue_training",
+        "validation",
+    }:
+        raise ValueError(
+            "purpose must be base_model_initialization, continue_training, or validation"
+        )
     mlflow = mlflow_module or _import_mlflow()
     mlflow.set_registry_uri(registry_uri)
     client = mlflow.tracking.MlflowClient()
@@ -355,9 +380,9 @@ def materialize(
     )
 
     resolved_artifact_uri = artifact_uri or reference.uri
-    return {
+    result = {
         "status": "current",
-        "mode": "continue",
+        "purpose": purpose,
         "registry_uri": registry_uri,
         "source_model_uri": reference.uri,
         "artifact_uri": resolved_artifact_uri,
@@ -388,6 +413,9 @@ def materialize(
         "tokenizer_files": tokenizer_files,
         "requires_hf_token": False,
     }
+    if purpose == "continue_training":
+        result["mode"] = "continue"
+    return result
 
 
 def main() -> None:
@@ -399,6 +427,11 @@ def main() -> None:
         help="Explicit models:/<catalog>.<schema>.<model>/<version> URI",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--purpose",
+        choices=("base_model_initialization", "continue_training", "validation"),
+        default="continue_training",
+    )
     parser.add_argument("--registry-uri", default="databricks-uc")
     parser.add_argument(
         "--artifact-uri",
@@ -420,9 +453,24 @@ def main() -> None:
         if args.model_uri
         else reference_from_config(args.config)
     )
+    if (
+        args.config
+        and args.purpose == "continue_training"
+        and not use_existing_weights_from_config(args.config)
+    ):
+        raise ValueError(
+            "source.use_existing_weights is false; do not initialize continued "
+            "training from the configured legacy model"
+        )
+    if args.config and args.purpose == "base_model_initialization":
+        raise ValueError(
+            "base_model_initialization requires the pinned --model-uri returned by "
+            "resolve_training_source.py"
+        )
     result = materialize(
         reference,
         args.output_dir,
+        purpose=args.purpose,
         registry_uri=args.registry_uri,
         artifact_uri=args.artifact_uri,
         checkpoint_subpath=args.checkpoint_subpath,

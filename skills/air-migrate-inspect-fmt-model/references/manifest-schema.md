@@ -11,6 +11,7 @@ source:
   schema: schema
   model: model
   version: 1
+  use_existing_weights: true
   status: READY
   run_id: abc123
 target:
@@ -79,12 +80,24 @@ inspection:
   evidence: []
 plan:
   status: absent  # absent | current | stale
+  input_model:
+    source: null  # materialized_uc_model | materialized_system_ai | hugging_face
+    source_model_uri: null
+    model_path: null
+    tokenizer_path: null
 materialization:
   status: absent  # absent | required | current | stale | not_required
+  source_resolution:
+    model_source: null  # existing_uc | system_ai | hugging_face
+    source_model_uri: null
+    match_basis: null
 generation:
   status: absent  # absent | current | stale
 validation:
   status: absent  # absent | current | stale
+  report: null
+  token_accuracy_evidence: null
+  verdict: null  # pass | fail | inconclusive
 ```
 
 For every inferred or ambiguous training value, use an object containing `value`, `provenance`, `confidence`, and `evidence` instead of a bare scalar. Never put access tokens, secret values, or downloaded weight contents in the manifest.

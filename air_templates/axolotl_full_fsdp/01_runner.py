@@ -59,6 +59,9 @@ from train import load_training_config, register_trained_model
 training_config, _ = load_training_config(CONFIG_PATH)
 print(f"Configuration: {CONFIG_PATH}")
 print(f"Model: {training_config['model_name']}")
+print(f"Model source: {training_config['model_source']}")
+print(f"Use existing weights: {training_config['use_existing_weights']}")
+print(f"Source model URI: {training_config.get('source_model_uri')}")
 print(f"Tokenizer: {training_config.get('tokenizer_path') or training_config['model_name']}")
 print(f"Training data: {training_config['train_data_path']}")
 print(f"Evaluation data: {training_config['eval_data_path']}")
@@ -70,9 +73,9 @@ print(f"UC model target: {training_config['registered_model_name']}")
 # MAGIC %md
 # MAGIC ## Configure Hugging Face access
 # MAGIC
-# MAGIC Remote gated models require a Hugging Face token. A model and tokenizer
-# MAGIC materialized to absolute UC Volume paths do not. If `HF_TOKEN` is
-# MAGIC already defined in the notebook environment, it is used instead.
+# MAGIC Hugging Face sources can require a token. Existing UC and `system.ai`
+# MAGIC sources are materialized to UC Volume paths and do not. If `HF_TOKEN`
+# MAGIC is already defined in the notebook environment, it is used instead.
 
 # COMMAND ----------
 

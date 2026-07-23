@@ -41,14 +41,18 @@ command: torchrun --nproc_per_node=8 $CODE_SOURCE_PATH/train.py
 
 parameters:
   training_config:
+    # Generated migrations set this from migrate/config.yaml. When true,
+    # model_name/tokenizer_path must be the materialized configured UC version.
+    use_existing_weights: false
+    model_source: hugging_face  # existing_uc | system_ai | hugging_face
+    source_model_uri:
     model_name: meta-llama/Meta-Llama-3.1-70B-Instruct
-    # Continue mode may set model_name and tokenizer_path to the worker-readable
-    # paths emitted by air-migrate-materialize-uc-model.
+    # existing_uc/system_ai sources set these to worker-readable Volume paths.
     tokenizer_path:
     experiment_path: /Shared/llama31_70b_instruct_axolotl_qlora_fsdp
     mlflow_run_name: llama31-70b-instruct-axolotl-qlora-fsdp
-    # The runner notebook registers the final PEFT adapter here as a new model
-    # version. The catalog and schema must already exist.
+    # The runner merges the PEFT adapter into the unquantized base model and
+    # registers that full checkpoint here. The catalog/schema must exist.
     registered_model_name: doan.ft_api_migration.llama31_70b_instruct_axolotl_qlora_fsdp
 
     # JSONL records must have OpenAI-style `messages` arrays. These defaults
@@ -56,6 +60,7 @@ parameters:
     train_data_path: /Volumes/doan/ft_api_migration/finetuning_api/tabformer_fraud/train.jsonl
     eval_data_path: /Volumes/doan/ft_api_migration/finetuning_api/tabformer_fraud/eval.jsonl
     output_dir: /Volumes/doan/ft_api_migration/finetuning_api/axolotl_qlora_fsdp/llama31_70b_instruct
+    merged_output_dir: /Volumes/doan/ft_api_migration/finetuning_api/axolotl_qlora_fsdp/llama31_70b_instruct_merged
 
     # QLoRA freezes the 4-bit base model and updates only the LoRA adapters.
     adapter: qlora

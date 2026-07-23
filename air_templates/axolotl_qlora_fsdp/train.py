@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ import yaml
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = PROJECT_DIR / "train.yaml"
 VOLUME_PREFIX = "/Volumes/"
+MODEL_URI_PATTERN = re.compile(r"^models:/([^/]+)/([1-9][0-9]*)$")
 REQUIRED_FSDP_MODES = {"full_shard", "auto_wrap"}
 
 
@@ -79,6 +81,63 @@ def _needs_hf_token(config: dict[str, Any]) -> bool:
     if config.get("tokenizer_path"):
         references.append(str(config["tokenizer_path"]))
     return any(not _is_local_model_reference(value) for value in references)
+
+
+def _validate_model_source(config: dict[str, Any]) -> None:
+    use_existing_weights = config.get("use_existing_weights")
+    if not isinstance(use_existing_weights, bool):
+        raise ValueError("training_config.use_existing_weights must be true or false")
+
+    model_source = _required_string(config, "model_source")
+    if model_source not in {"existing_uc", "system_ai", "hugging_face"}:
+        raise ValueError(
+            "training_config.model_source must be existing_uc, system_ai, or hugging_face"
+        )
+    source_model_uri = config.get("source_model_uri")
+    model_uri_match = None
+    if source_model_uri is not None:
+        source_model_uri = str(source_model_uri).strip()
+        model_uri_match = MODEL_URI_PATTERN.fullmatch(source_model_uri)
+        if model_uri_match is None or len(model_uri_match.group(1).split(".")) != 3:
+            raise ValueError(
+                "training_config.source_model_uri must be null or use "
+                "models:/<catalog>.<schema>.<model>/<version>"
+            )
+        config["source_model_uri"] = source_model_uri
+
+    references = [str(config["model_name"])]
+    if config.get("tokenizer_path"):
+        references.append(str(config["tokenizer_path"]))
+    volume_references = all(value.startswith(VOLUME_PREFIX) for value in references)
+
+    if use_existing_weights:
+        if model_source != "existing_uc" or model_uri_match is None:
+            raise ValueError(
+                "use_existing_weights=true requires model_source=existing_uc and "
+                "a versioned source_model_uri"
+            )
+        if not volume_references:
+            raise ValueError(
+                "Existing UC weights and tokenizer must be materialized under /Volumes"
+            )
+    elif model_source == "existing_uc":
+        raise ValueError("model_source=existing_uc requires use_existing_weights=true")
+    elif model_source == "system_ai":
+        if model_uri_match is None or not model_uri_match.group(1).startswith("system.ai."):
+            raise ValueError(
+                "model_source=system_ai requires a versioned models:/system.ai.<model> URI"
+            )
+        if not volume_references:
+            raise ValueError(
+                "system.ai weights and tokenizer must be materialized under /Volumes"
+            )
+    else:
+        if source_model_uri is not None:
+            raise ValueError("model_source=hugging_face requires source_model_uri=null")
+        if any(_is_local_model_reference(value) for value in references):
+            raise ValueError(
+                "model_source=hugging_face requires remote Hugging Face model references"
+            )
 
 
 def _positive_int(config: dict[str, Any], key: str) -> int:
@@ -181,12 +240,14 @@ def load_training_config(
 
     for key in (
         "model_name",
+        "model_source",
         "experiment_path",
         "mlflow_run_name",
         "registered_model_name",
         "train_data_path",
         "eval_data_path",
         "output_dir",
+        "merged_output_dir",
         "optimizer",
         "lr_scheduler",
         "attn_implementation",
@@ -201,6 +262,8 @@ def load_training_config(
         if not tokenizer_path:
             raise ValueError("training_config.tokenizer_path must be null or non-empty")
         config["tokenizer_path"] = tokenizer_path
+
+    _validate_model_source(config)
 
     for key in (
         "sequence_len",
@@ -257,10 +320,12 @@ def load_training_config(
     train_path = _required_string(config, "train_data_path")
     eval_path = _required_string(config, "eval_data_path")
     output_dir = _required_string(config, "output_dir")
+    merged_output_dir = _required_string(config, "merged_output_dir")
     for key, value in (
         ("train_data_path", train_path),
         ("eval_data_path", eval_path),
         ("output_dir", output_dir),
+        ("merged_output_dir", merged_output_dir),
     ):
         if not value.startswith(VOLUME_PREFIX):
             raise ValueError(
@@ -269,6 +334,8 @@ def load_training_config(
             )
     if train_path == eval_path:
         raise ValueError("train_data_path and eval_data_path must be different")
+    if Path(output_dir).resolve() == Path(merged_output_dir).resolve():
+        raise ValueError("output_dir and merged_output_dir must be different")
 
     target_modules = config.get("lora_target_modules")
     if not isinstance(target_modules, list) or not target_modules:
@@ -451,6 +518,8 @@ def run_training(
     if rank == 0:
         print(f"Configuration: {resolved_path}")
         print(f"Model: {config['model_name']}")
+        print(f"Model source: {config['model_source']}")
+        print(f"Source model URI: {config.get('source_model_uri')}")
         print(f"Training data: {config['train_data_path']}")
         print(f"Evaluation data: {config['eval_data_path']}")
         print(f"Adapter output: {config['output_dir']}")
@@ -466,29 +535,29 @@ def run_training(
         "global_step": int(trainer.state.global_step),
         "mlflow_run_id": run_id if rank == 0 else None,
         "output_dir": config["output_dir"] if rank == 0 else None,
+        "model_source": config["model_source"] if rank == 0 else None,
+        "source_model_uri": config.get("source_model_uri") if rank == 0 else None,
     }
 
 
-def register_trained_model(
-    training_result: dict[str, Any],
+def merge_peft_model(
     config_path: str | Path | None = None,
-) -> dict[str, str]:
-    """Log the final PEFT adapter and register it in Unity Catalog."""
+) -> dict[str, Any]:
+    """Merge the trained PEFT adapter into an unquantized base checkpoint."""
     config, _ = load_training_config(config_path)
-    run_id = str(training_result.get("mlflow_run_id") or "").strip()
-    if not run_id:
-        raise ValueError("Training must return an MLflow run ID before registration")
+    if _needs_hf_token(config) and not os.environ.get("HF_TOKEN"):
+        raise RuntimeError(
+            "HF_TOKEN is required to reload the configured base model or tokenizer"
+        )
 
-    output_dir = Path(str(training_result.get("output_dir") or "")).resolve()
-    if output_dir != Path(config["output_dir"]).resolve():
-        raise ValueError("Training result output_dir does not match train.yaml")
-    adapter_config = output_dir / "adapter_config.json"
+    adapter_dir = Path(config["output_dir"]).resolve()
+    adapter_config = adapter_dir / "adapter_config.json"
     adapter_weights = next(
         (
             path
             for path in (
-                output_dir / "adapter_model.safetensors",
-                output_dir / "adapter_model.bin",
+                adapter_dir / "adapter_model.safetensors",
+                adapter_dir / "adapter_model.bin",
             )
             if path.is_file()
         ),
@@ -500,119 +569,125 @@ def register_trained_model(
             "adapter_model.safetensors or adapter_model.bin"
         )
 
+    rank, world_size, _ = distributed_context()
+    if rank != 0:
+        return {
+            "rank": rank,
+            "world_size": world_size,
+            "merged_output_dir": None,
+        }
+
+    merged_output_dir = Path(config["merged_output_dir"]).resolve()
+    if merged_output_dir.exists():
+        if not merged_output_dir.is_dir():
+            raise NotADirectoryError(
+                f"merged_output_dir is not a directory: {merged_output_dir}"
+            )
+        if any(merged_output_dir.iterdir()):
+            raise FileExistsError(
+                f"merged_output_dir must be empty before merging: {merged_output_dir}"
+            )
+    merged_output_dir.mkdir(parents=True, exist_ok=True)
+
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer_reference = config.get("tokenizer_path") or config["model_name"]
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_reference, trust_remote_code=False
+    )
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config["model_name"],
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+        trust_remote_code=False,
+        attn_implementation="eager",
+    )
+    if getattr(base_model, "is_quantized", False):
+        raise ValueError("PEFT merging requires an unquantized base model")
+    peft_model = PeftModel.from_pretrained(
+        base_model,
+        str(adapter_dir),
+        is_trainable=False,
+    )
+    merged_model = peft_model.merge_and_unload(safe_merge=True, progressbar=True)
+    merged_model.config.use_cache = True
+    merged_model.save_pretrained(
+        str(merged_output_dir),
+        safe_serialization=True,
+        max_shard_size="5GB",
+    )
+    tokenizer.save_pretrained(str(merged_output_dir))
+
+    return {
+        "rank": rank,
+        "world_size": world_size,
+        "adapter_output_dir": str(adapter_dir),
+        "merged_output_dir": str(merged_output_dir),
+    }
+
+
+def register_trained_model(
+    training_result: dict[str, Any],
+    merge_result: dict[str, Any],
+    config_path: str | Path | None = None,
+) -> dict[str, str]:
+    """Log the merged full checkpoint and register it in Unity Catalog."""
+    config, _ = load_training_config(config_path)
+    run_id = str(training_result.get("mlflow_run_id") or "").strip()
+    if not run_id:
+        raise ValueError("Training must return an MLflow run ID before registration")
+
+    merged_output_dir = Path(
+        str(merge_result.get("merged_output_dir") or "")
+    ).resolve()
+    if merged_output_dir != Path(config["merged_output_dir"]).resolve():
+        raise ValueError("Merge result merged_output_dir does not match train.yaml")
+    if not (merged_output_dir / "config.json").is_file():
+        raise FileNotFoundError(
+            f"The merged output does not contain config.json: {merged_output_dir}"
+        )
+    weight_files = [
+        path
+        for pattern in ("model*.safetensors", "pytorch_model*.bin")
+        for path in merged_output_dir.glob(pattern)
+        if path.is_file()
+    ]
+    if not weight_files:
+        raise FileNotFoundError(
+            f"The merged output does not contain full model weights: {merged_output_dir}"
+        )
+    if (merged_output_dir / "adapter_config.json").exists() or any(
+        merged_output_dir.glob("adapter_model.*")
+    ):
+        raise ValueError("Merged output still contains PEFT adapter artifacts")
+
     import mlflow
-    import pandas as pd
-
-    class PeftCausalLMModel(mlflow.pyfunc.PythonModel):
-        """Lazy-loading text-generation wrapper for a registered PEFT adapter."""
-
-        def __init__(self, base_model: str, tokenizer: str, weight_name: str):
-            self.base_model = base_model
-            self.tokenizer = tokenizer
-            self.weight_name = weight_name
-
-        def load_context(self, context):
-            import shutil
-            import tempfile
-
-            from peft import PeftModel
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-
-            self._adapter_dir = tempfile.mkdtemp(prefix="mlflow-peft-")
-            shutil.copy2(
-                context.artifacts["adapter_config"],
-                Path(self._adapter_dir) / "adapter_config.json",
-            )
-            shutil.copy2(
-                context.artifacts["adapter_weights"],
-                Path(self._adapter_dir) / self.weight_name,
-            )
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self.tokenizer, trust_remote_code=False
-            )
-            if self._tokenizer.pad_token_id is None:
-                self._tokenizer.pad_token = self._tokenizer.eos_token
-            base_model = AutoModelForCausalLM.from_pretrained(
-                self.base_model,
-                torch_dtype="auto",
-                device_map="auto",
-                trust_remote_code=False,
-            )
-            self._model = PeftModel.from_pretrained(base_model, self._adapter_dir)
-            self._model.eval()
-
-        def predict(self, context, model_input, params=None):
-            params = dict(params or {})
-            if hasattr(model_input, "columns"):
-                if "prompt" not in model_input.columns:
-                    raise ValueError("Model input must contain a prompt column")
-                prompts = [str(value) for value in model_input["prompt"].tolist()]
-            elif isinstance(model_input, dict) and "prompt" in model_input:
-                values = model_input["prompt"]
-                prompts = (
-                    [str(value) for value in values]
-                    if isinstance(values, list)
-                    else [str(values)]
-                )
-            elif isinstance(model_input, list):
-                prompts = [str(value) for value in model_input]
-            else:
-                raise ValueError("Model input must provide one or more prompts")
-
-            inputs = self._tokenizer(
-                prompts, return_tensors="pt", padding=True, truncation=True
-            ).to(self._model.device)
-            generation_args = {
-                "max_new_tokens": int(params.get("max_new_tokens", 128)),
-                "do_sample": bool(params.get("do_sample", False)),
-            }
-            if generation_args["do_sample"]:
-                generation_args["temperature"] = float(params.get("temperature", 0.7))
-            generated = self._model.generate(**inputs, **generation_args)
-            prompt_length = inputs["input_ids"].shape[1]
-            return self._tokenizer.batch_decode(
-                generated[:, prompt_length:], skip_special_tokens=True
-            )
 
     mlflow.set_tracking_uri("databricks")
     mlflow.set_registry_uri("databricks-uc")
     registered_model_name = _validate_registered_model_name(config)
-    tokenizer_reference = config.get("tokenizer_path") or config["model_name"]
-    signature = mlflow.models.infer_signature(
-        pd.DataFrame({"prompt": ["Classify this example."]}),
-        ["classification"],
-        params={
-            "max_new_tokens": 128,
-            "do_sample": False,
-            "temperature": 0.7,
-        },
-    )
     with mlflow.start_run(run_id=run_id):
-        model_info = mlflow.pyfunc.log_model(
+        model_info = mlflow.transformers.log_model(
+            transformers_model=str(merged_output_dir),
+            task="text-generation",
             name="model",
-            python_model=PeftCausalLMModel(
-                base_model=config["model_name"],
-                tokenizer=tokenizer_reference,
-                weight_name=adapter_weights.name,
-            ),
-            artifacts={
-                "adapter_config": str(adapter_config),
-                "adapter_weights": str(adapter_weights),
-            },
-            signature=signature,
             pip_requirements=[
                 "mlflow>=3.6,<4",
-                "pandas",
                 "torch",
                 "transformers",
                 "accelerate",
-                "peft",
                 "safetensors",
             ],
             metadata={
-                "artifact_type": "peft_adapter",
+                "artifact_type": "merged_peft_checkpoint",
                 "base_model": config["model_name"],
-                "tokenizer": tokenizer_reference,
+                "base_model_source": config["model_source"],
+                "base_model_uri": config.get("source_model_uri"),
+                "use_existing_weights": config["use_existing_weights"],
+                "adapter_output_dir": config["output_dir"],
                 "training_run_id": run_id,
             },
         )

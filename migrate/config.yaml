@@ -3,7 +3,10 @@ source:
   catalog: doan
   schema: ft_api_migration
   model: tabformer_fraud_classifier
-  version: 1
+  version: 2
+  # true: continue training from this exact UC version.
+  # false: retrain from the original base model, preferring system.ai and then HF.
+  use_existing_weights: true
 
 # Leave all target fields blank to register the migrated model as a new version
 # of the source model. Otherwise, provide all three target fields.

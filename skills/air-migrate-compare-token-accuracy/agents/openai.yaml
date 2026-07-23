@@ -1,0 +1,4 @@
+interface:
+  display_name: "AIR Migrate: Compare Token Accuracy"
+  short_description: "Compare migrated and legacy token accuracy"
+  default_prompt: "Use $air-migrate-compare-token-accuracy to compare a migrated model with the configured legacy model on assistant response-token accuracy."

@@ -59,10 +59,14 @@ from train import load_training_config, register_trained_model
 training_config, _ = load_training_config(CONFIG_PATH)
 print(f"Configuration: {CONFIG_PATH}")
 print(f"Model: {training_config['model_name']}")
+print(f"Model source: {training_config['model_source']}")
+print(f"Use existing weights: {training_config['use_existing_weights']}")
+print(f"Source model URI: {training_config.get('source_model_uri')}")
 print(f"Tokenizer: {training_config.get('tokenizer_path') or training_config['model_name']}")
 print(f"Training data: {training_config['train_data_path']}")
 print(f"Evaluation data: {training_config['eval_data_path']}")
 print(f"Adapter output: {training_config['output_dir']}")
+print(f"Merged output: {training_config['merged_output_dir']}")
 print(f"UC model target: {training_config['registered_model_name']}")
 
 # COMMAND ----------
@@ -70,9 +74,9 @@ print(f"UC model target: {training_config['registered_model_name']}")
 # MAGIC %md
 # MAGIC ## Configure Hugging Face access
 # MAGIC
-# MAGIC Remote gated models require a Hugging Face token. A model and tokenizer
-# MAGIC materialized to absolute UC Volume paths do not. If `HF_TOKEN` is
-# MAGIC already defined in the notebook environment, it is used instead.
+# MAGIC Hugging Face sources can require a token. Existing UC and `system.ai`
+# MAGIC sources are materialized to UC Volume paths and do not. If `HF_TOKEN`
+# MAGIC is already defined in the notebook environment, it is used instead.
 
 # COMMAND ----------
 
@@ -153,10 +157,51 @@ rank_zero_result
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Register the model in Unity Catalog
+# MAGIC ## Merge the PEFT adapter into the base model
+# MAGIC
+# MAGIC The merge reloads the unquantized base model, applies the trained
+# MAGIC adapter with PEFT's safe merge, and writes portable sharded
+# MAGIC safetensors to `training_config.merged_output_dir`. The destination
+# MAGIC must be an empty UC Volume directory. For this 70B template the merge
+# MAGIC uses automatic GPU/CPU placement across the 8xH100 allocation.
+
+# COMMAND ----------
+
+@distributed(gpus=num_gpus, gpu_type=GPUType.H100)
+def run_merge_job(config_path: str, hf_token: str | None):
+    import os
+    import sys
+    from pathlib import Path
+
+    project_dir = Path(config_path).resolve().parent
+    if str(project_dir) not in sys.path:
+        sys.path.insert(0, str(project_dir))
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+
+    from train import merge_peft_model
+
+    return merge_peft_model(config_path=config_path)
+
+
+merge_results = run_merge_job.distributed(str(CONFIG_PATH), HF_TOKEN)
+rank_zero_merge = next(
+    (result for result in merge_results if result and result.get("rank") == 0),
+    None,
+)
+if rank_zero_merge is None:
+    raise RuntimeError(f"Merge returned no rank-zero result: {merge_results}")
+
+print(f"Merged checkpoint: {rank_zero_merge['merged_output_dir']}")
+rank_zero_merge
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Register the merged model in Unity Catalog
 # MAGIC
 # MAGIC The target is read from `training_config.registered_model_name` in
-# MAGIC `train.yaml`. The runner logs the final adapter files to the training
+# MAGIC `train.yaml`. The runner logs the merged full checkpoint to the training
 # MAGIC MLflow run and creates a new UC model version. The caller needs
 # MAGIC `USE CATALOG`, `USE SCHEMA`, and permission to create or update the
 # MAGIC configured registered model.
@@ -165,6 +210,7 @@ rank_zero_result
 
 registered_model = register_trained_model(
     training_result=rank_zero_result,
+    merge_result=rank_zero_merge,
     config_path=CONFIG_PATH,
 )
 print(f"Registered model: {registered_model['model_uri']}")
@@ -175,11 +221,11 @@ registered_model
 # MAGIC %md
 # MAGIC The resulting directory contains the PEFT/QLoRA adapter and Axolotl
 # MAGIC checkpoints. The base weights remain frozen and are not copied into the
-# MAGIC final adapter artifact. Unity Catalog contains an MLflow PEFT model
-# MAGIC version that lazily loads the configured base model and adapter. For
-# MAGIC remote gated models, edit the `HF_TOKEN` secret reference in
-# MAGIC `train.yaml`; materialized local model/tokenizer paths do not require
-# MAGIC it. Submit the same training workload from a terminal with:
+# MAGIC training artifact. The separate merged directory and Unity Catalog
+# MAGIC version contain full model weights with the adapter applied. For remote
+# MAGIC gated models, edit the `HF_TOKEN` secret reference in `train.yaml`;
+# MAGIC materialized local model/tokenizer paths do not require it. Submit the
+# MAGIC same training workload from a terminal with:
 # MAGIC
 # MAGIC ```bash
 # MAGIC air run --file train.yaml --watch

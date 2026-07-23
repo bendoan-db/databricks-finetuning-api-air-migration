@@ -1,4 +1,4 @@
 interface:
   display_name: "AIR Migrate: Load UC Weights"
-  short_description: "Materialize UC model weights for AIR"
-  default_prompt: "Use $air-migrate-materialize-uc-model to materialize portable Hugging Face weights from the configured Unity Catalog model."
+  short_description: "Resolve and stage AIR training weights"
+  default_prompt: "Use $air-migrate-materialize-uc-model to apply use_existing_weights, resolve the training source, and stage any selected Unity Catalog weights."

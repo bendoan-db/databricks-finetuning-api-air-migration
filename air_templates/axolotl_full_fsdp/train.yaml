@@ -41,9 +41,13 @@ command: torchrun --nproc_per_node=8 $CODE_SOURCE_PATH/train.py
 
 parameters:
   training_config:
+    # Generated migrations set this from migrate/config.yaml. When true,
+    # model_name/tokenizer_path must be the materialized configured UC version.
+    use_existing_weights: false
+    model_source: hugging_face  # existing_uc | system_ai | hugging_face
+    source_model_uri:
     model_name: meta-llama/Meta-Llama-3.1-8B-Instruct
-    # Continue mode may set model_name and tokenizer_path to the worker-readable
-    # paths emitted by air-migrate-materialize-uc-model.
+    # existing_uc/system_ai sources set these to worker-readable Volume paths.
     tokenizer_path:
     experiment_path: /Shared/llama31_8b_instruct_axolotl_full_fsdp
     mlflow_run_name: llama31-8b-instruct-axolotl-full-fsdp

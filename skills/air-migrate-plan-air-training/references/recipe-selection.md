@@ -3,8 +3,8 @@
 | Objective and constraint | Recipe | Output | Key tradeoff |
 |---|---|---|---|
 | Reproduce full-weight training with the closest practical parity | `axolotl_full_fsdp` | Consolidated full model and tokenizer | Highest memory and compute cost |
-| Cost-efficient PEFT where the 4-bit base fits per GPU | `axolotl_qlora` | PEFT adapter and tokenizer metadata | Not full-weight parity |
-| PEFT for a very large model whose 4-bit base still needs sharding | `axolotl_qlora_fsdp` | PEFT adapter with a reproducible base dependency | More distributed complexity; checkpoint consolidation pressure |
+| Cost-efficient PEFT where the 4-bit base fits per GPU | `axolotl_qlora` | PEFT adapter plus merged full registration checkpoint | Not full-weight training parity; merge requires another base-model load |
+| PEFT for a very large model whose 4-bit base still needs sharding | `axolotl_qlora_fsdp` | PEFT adapter plus merged full registration checkpoint | More distributed complexity and merge-time memory pressure |
 | Repackage existing portable weights without training | `none` | Registered copy of the existing artifact | Not an AI Runtime training migration |
 | Unsupported architecture, objective, data modality, or framework requirement | `custom` | Explicitly designed workload | No approved template; requires extension before generation |
 

@@ -15,7 +15,8 @@ Read and follow these sibling skill instructions in order when installed togethe
 2. [`air-migrate-plan-air-training`](../air-migrate-plan-air-training/SKILL.md)
 3. [`air-migrate-materialize-uc-model`](../air-migrate-materialize-uc-model/SKILL.md)
 4. [`air-migrate-generate-air-job`](../air-migrate-generate-air-job/SKILL.md)
-5. [`air-migrate-validate-model-migration`](../air-migrate-validate-model-migration/SKILL.md)
+5. [`air-migrate-compare-token-accuracy`](../air-migrate-compare-token-accuracy/SKILL.md)
+6. [`air-migrate-validate-model-migration`](../air-migrate-validate-model-migration/SKILL.md)
 
 If a stage skill is unavailable, stop before that stage and identify the missing package; do not improvise its guarded workflow.
 
@@ -23,17 +24,20 @@ If a stage skill is unavailable, stop before that stage and identify the missing
 
 1. **Resolve configuration**
    - Read `migrate/config.yaml`.
+   - Require `source.use_existing_weights` to be boolean and preserve it unchanged in every downstream stage.
    - Treat all-blank target fields as a new version at the source model name.
    - Reject partially populated target fields.
 2. **Inspect**
    - Recover UC/MLflow lineage, data, task semantics, hyperparameters, artifacts, permissions, and unknowns.
    - Gate: require a viable retrain, continue, or repackage starting point.
 3. **Plan**
-   - Select migration semantics, objective, recipe, compute, checkpoint/output contract, intentional divergences, and acceptance criteria.
+   - When `use_existing_weights` is true, select continued training from the configured UC version. When false, select retraining from the recovered base model and resolve `system.ai` before falling back to Hugging Face.
+   - Select objective, recipe, compute, checkpoint/output contract, intentional divergences, and acceptance criteria.
    - Gate: require an explicit plan and a supported training recipe, `none` for repackaging, or a documented custom-template blocker.
-4. **Materialize existing weights when continuing**
-   - For continue mode, use `air-migrate-materialize-uc-model` to download and structurally validate portable full weights and tokenizer files in a shared UC Volume.
-   - For retraining and repackaging, record materialization as not required.
+4. **Resolve and materialize training weights**
+   - Use `resolve_training_source.py` with the inspected base-model ID.
+   - If `use_existing_weights` is true, materialize and validate the configured UC model and tokenizer in a shared UC Volume.
+   - If false and an exact `system.ai` model exists, pin and materialize that version. If no match exists, use the recovered Hugging Face model ID and record materialization as not required.
    - Gate: never pass a `models:/` URI directly to Axolotl; require current materialization provenance and worker-readable paths.
 5. **Generate from templates**
    - For retraining or continued training, use `air-migrate-generate-air-job` to copy exactly one approved `air_templates/` recipe before customization.
@@ -46,6 +50,8 @@ If a stage skill is unavailable, stop before that stage and identify the missing
    - Do not overwrite an existing model version; UC registration creates a new version.
 7. **Validate**
    - Compare source and target against the predeclared criteria on identical evaluation inputs.
+   - Materialize the exact registered source and target full checkpoints, then use `air-migrate-compare-token-accuracy` to compare assistant response-token accuracy. The source version must come from `migrate/config.yaml`; the target must be the version created by this workflow.
+   - Treat tokenizer or chat-serialization differences as an inconclusive token-accuracy comparison, not a pass.
    - Gate: do not claim completion until artifact integrity and the validation verdict are recorded.
 8. **Report**
    - Summarize source and target URIs, selected mode/recipe/template, deliberate differences, runs, artifacts, validation verdict, remaining risks, and exact next action.
@@ -62,7 +68,7 @@ Use no fallback. For `recipe: none`, skip generation only when `mode: repackage`
 
 ## Resume and invalidation
 
-Reuse a completed stage only when its inputs and evidence are still current. Reinspect when the source version, source run, config, permissions, or data changes. Replan when inspection changes. Rematerialize when a continue-mode source, destination, artifact, or tokenizer changes. Regenerate when the plan, materialization, or authoritative template changes. Revalidate when generated code, data, model artifacts, or acceptance criteria change.
+Reuse a completed stage only when its inputs and evidence are still current. Reinspect when the source version, `use_existing_weights`, source run, config, permissions, or data changes. Replan when inspection or weight-source resolution changes. Rematerialize when a selected UC source, destination, artifact, or tokenizer changes. Regenerate when the plan, materialization, or authoritative template changes. Rerun token accuracy and revalidate when generated code, evaluation data, model artifacts, tokenizer/chat templates, sequence-length policy, or acceptance criteria change.
 
 ## Safety and truthfulness
 

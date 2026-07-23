@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ import yaml
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = PROJECT_DIR / "train.yaml"
 VOLUME_PREFIX = "/Volumes/"
+MODEL_URI_PATTERN = re.compile(r"^models:/([^/]+)/([1-9][0-9]*)$")
 REQUIRED_FSDP_MODES = {"full_shard", "auto_wrap"}
 
 
@@ -79,6 +81,63 @@ def _needs_hf_token(config: dict[str, Any]) -> bool:
     if config.get("tokenizer_path"):
         references.append(str(config["tokenizer_path"]))
     return any(not _is_local_model_reference(value) for value in references)
+
+
+def _validate_model_source(config: dict[str, Any]) -> None:
+    use_existing_weights = config.get("use_existing_weights")
+    if not isinstance(use_existing_weights, bool):
+        raise ValueError("training_config.use_existing_weights must be true or false")
+
+    model_source = _required_string(config, "model_source")
+    if model_source not in {"existing_uc", "system_ai", "hugging_face"}:
+        raise ValueError(
+            "training_config.model_source must be existing_uc, system_ai, or hugging_face"
+        )
+    source_model_uri = config.get("source_model_uri")
+    model_uri_match = None
+    if source_model_uri is not None:
+        source_model_uri = str(source_model_uri).strip()
+        model_uri_match = MODEL_URI_PATTERN.fullmatch(source_model_uri)
+        if model_uri_match is None or len(model_uri_match.group(1).split(".")) != 3:
+            raise ValueError(
+                "training_config.source_model_uri must be null or use "
+                "models:/<catalog>.<schema>.<model>/<version>"
+            )
+        config["source_model_uri"] = source_model_uri
+
+    references = [str(config["model_name"])]
+    if config.get("tokenizer_path"):
+        references.append(str(config["tokenizer_path"]))
+    volume_references = all(value.startswith(VOLUME_PREFIX) for value in references)
+
+    if use_existing_weights:
+        if model_source != "existing_uc" or model_uri_match is None:
+            raise ValueError(
+                "use_existing_weights=true requires model_source=existing_uc and "
+                "a versioned source_model_uri"
+            )
+        if not volume_references:
+            raise ValueError(
+                "Existing UC weights and tokenizer must be materialized under /Volumes"
+            )
+    elif model_source == "existing_uc":
+        raise ValueError("model_source=existing_uc requires use_existing_weights=true")
+    elif model_source == "system_ai":
+        if model_uri_match is None or not model_uri_match.group(1).startswith("system.ai."):
+            raise ValueError(
+                "model_source=system_ai requires a versioned models:/system.ai.<model> URI"
+            )
+        if not volume_references:
+            raise ValueError(
+                "system.ai weights and tokenizer must be materialized under /Volumes"
+            )
+    else:
+        if source_model_uri is not None:
+            raise ValueError("model_source=hugging_face requires source_model_uri=null")
+        if any(_is_local_model_reference(value) for value in references):
+            raise ValueError(
+                "model_source=hugging_face requires remote Hugging Face model references"
+            )
 
 
 def _positive_int(config: dict[str, Any], key: str) -> int:
@@ -176,6 +235,7 @@ def load_training_config(
 
     for key in (
         "model_name",
+        "model_source",
         "experiment_path",
         "mlflow_run_name",
         "registered_model_name",
@@ -196,6 +256,8 @@ def load_training_config(
         if not tokenizer_path:
             raise ValueError("training_config.tokenizer_path must be null or non-empty")
         config["tokenizer_path"] = tokenizer_path
+
+    _validate_model_source(config)
 
     for key in (
         "sequence_len",
@@ -427,6 +489,8 @@ def run_training(
     if rank == 0:
         print(f"Configuration: {resolved_path}")
         print(f"Model: {config['model_name']}")
+        print(f"Model source: {config['model_source']}")
+        print(f"Source model URI: {config.get('source_model_uri')}")
         print(f"Training data: {config['train_data_path']}")
         print(f"Evaluation data: {config['eval_data_path']}")
         print(f"Full-model output: {config['output_dir']}")
@@ -442,6 +506,8 @@ def run_training(
         "global_step": int(trainer.state.global_step),
         "mlflow_run_id": run_id if rank == 0 else None,
         "output_dir": config["output_dir"] if rank == 0 else None,
+        "model_source": config["model_source"] if rank == 0 else None,
+        "source_model_uri": config.get("source_model_uri") if rank == 0 else None,
     }
 
 
@@ -504,6 +570,9 @@ def register_trained_model(
                 metadata={
                     "artifact_type": "full_transformers_checkpoint",
                     "base_model": config["model_name"],
+                    "base_model_source": config["model_source"],
+                    "base_model_uri": config.get("source_model_uri"),
+                    "use_existing_weights": config["use_existing_weights"],
                     "training_run_id": run_id,
                 },
             )

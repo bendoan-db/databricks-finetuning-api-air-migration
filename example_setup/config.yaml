@@ -1,0 +1,33 @@
+data:
+  # Unity Catalog destinations shared by every setup notebook.
+  catalog: doan
+  schema: ft_api_migration
+  table: tabformer_transactions
+
+  # Temporary storage for downloading and extracting the source archive.
+  staging_volume: data_setup
+
+  # Persistent storage for fine-tuning train and evaluation files.
+  volume: finetuning_api
+  output_dir: tabformer_fraud
+  train_file: train.jsonl
+  eval_file: eval.jsonl
+
+  # The full TabFormer dataset is highly imbalanced. Select the same number of
+  # deterministic examples from each class to keep this example affordable.
+  examples_per_label: 1000
+  eval_fraction: 0.1
+  split_seed: 42
+  system_prompt: >-
+    You classify credit-card transactions. Reply with exactly fraud or
+    non_fraud and no additional text.
+
+fine_tuning:
+  model: meta-llama/Llama-3.1-8B-Instruct
+  task_type: CHAT_COMPLETION
+  register_to: doan.ft_api_migration.tabformer_fraud_classifier_8b
+  training_duration: 1ep
+  # Leave null to use the service's model-specific default learning rate.
+  learning_rate: null
+  context_length: "1024"
+  validate_inputs: true

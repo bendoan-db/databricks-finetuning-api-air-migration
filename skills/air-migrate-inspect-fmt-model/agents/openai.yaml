@@ -1,0 +1,4 @@
+interface:
+  display_name: "AIR Migrate: Inspect FMT Model"
+  short_description: "Recover legacy fine-tuning lineage"
+  default_prompt: "Use $air-migrate-inspect-fmt-model to inspect a legacy fine-tuned Unity Catalog model and write its migration manifest."

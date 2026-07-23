@@ -1,0 +1,106 @@
+# Llama 3.1 8B Instruct full fine-tuning with FSDP on Databricks AI Runtime.
+#
+# Before running, update the Unity Catalog paths and, for remote gated models,
+# the HF_TOKEN secret below.
+# From this directory, submit with:
+#   air run --file train.yaml --watch
+
+experiment_name: llama31_8b_instruct_axolotl_full_fsdp
+
+environment:
+  version: '5'
+  dependencies:
+    # Axolotl's Flash Attention extra must be installed without build isolation.
+    - --no-build-isolation
+    - 'axolotl[flash-attn]==0.13.1'
+    - trl==0.27.1
+    - torchao==0.16.0
+    - 'mlflow>=3.6,<4'
+    - 'pyyaml>=6.0'
+
+compute:
+  num_accelerators: 8
+  accelerator_type: GPU_8xH100
+
+env_variables:
+  AXOLOTL_DO_NOT_TRACK: '1'
+  HF_MLFLOW_LOG_ARTIFACTS: 'false'
+  TOKENIZERS_PARALLELISM: 'false'
+
+# AI Runtime injects this Databricks secret into the workload as HF_TOKEN.
+# Remove this block when model_name/tokenizer_path are materialized local paths.
+secrets:
+  HF_TOKEN: your-secret-scope/hf_token
+
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: .
+
+command: torchrun --nproc_per_node=8 $CODE_SOURCE_PATH/train.py
+
+parameters:
+  training_config:
+    model_name: meta-llama/Meta-Llama-3.1-8B-Instruct
+    # Continue mode may set model_name and tokenizer_path to the worker-readable
+    # paths emitted by air-migrate-materialize-uc-model.
+    tokenizer_path:
+    experiment_path: /Shared/llama31_8b_instruct_axolotl_full_fsdp
+    mlflow_run_name: llama31-8b-instruct-axolotl-full-fsdp
+    # The runner notebook registers the final full checkpoint here as a new
+    # model version. The catalog and schema must already exist.
+    registered_model_name: doan.ft_api_migration.llama31_8b_instruct_axolotl_full_fsdp
+
+    # JSONL records must have OpenAI-style `messages` arrays. These defaults
+    # consume the train/eval files produced by example_setup/02_stage_data.
+    train_data_path: /Volumes/doan/ft_api_migration/finetuning_api/tabformer_fraud/train.jsonl
+    eval_data_path: /Volumes/doan/ft_api_migration/finetuning_api/tabformer_fraud/eval.jsonl
+    output_dir: /Volumes/doan/ft_api_migration/finetuning_api/axolotl_full_fsdp/llama31_8b_instruct
+
+    # Full fine-tuning updates every model weight; no PEFT adapter or weight
+    # quantization is used.
+    adapter:
+    load_in_8bit: false
+    load_in_4bit: false
+
+    sequence_len: 2048
+    sample_packing: true
+    eval_sample_packing: false
+
+    micro_batch_size: 1
+    gradient_accumulation_steps: 4
+    num_epochs: 1
+    learning_rate: 5.0e-6
+    optimizer: adamw_torch_fused
+    lr_scheduler: cosine
+    warmup_ratio: 0.1
+    weight_decay: 0.0
+    logging_steps: 1
+    evals_per_epoch: 1
+    saves_per_epoch: 1
+    save_total_limit: 2
+    save_first_step: false
+    save_safetensors: true
+    resume_from_checkpoint:
+
+    gradient_checkpointing: true
+    gradient_checkpointing_use_reentrant: false
+    bf16: auto
+    tf32: false
+    attn_implementation: flash_attention_2
+    seed: 42
+
+    # FSDP full-shards parameters, gradients, and optimizer state across all
+    # eight GPUs. Checkpoints and the final model use portable full state dicts.
+    fsdp:
+      - full_shard
+      - auto_wrap
+    fsdp_config:
+      sync_module_states: true
+      offload_params: false
+      use_orig_params: false
+      cpu_ram_efficient_loading: true
+      auto_wrap_policy: TRANSFORMER_BASED_WRAP
+      transformer_layer_cls_to_wrap: LlamaDecoderLayer
+      state_dict_type: FULL_STATE_DICT
+      final_state_dict_type: FULL_STATE_DICT

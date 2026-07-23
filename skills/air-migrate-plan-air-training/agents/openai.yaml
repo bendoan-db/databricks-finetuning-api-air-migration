@@ -1,0 +1,4 @@
+interface:
+  display_name: "AIR Migrate: Plan Training"
+  short_description: "Design an AI Runtime migration plan"
+  default_prompt: "Use $air-migrate-plan-air-training to turn a migration manifest into an AI Runtime training plan."

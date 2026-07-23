@@ -1,0 +1,13 @@
+# Unity Catalog model version produced by the legacy fine-tuning API.
+source:
+  catalog: doan
+  schema: ft_api_migration
+  model: tabformer_fraud_classifier
+  version: 1
+
+# Leave all target fields blank to register the migrated model as a new version
+# of the source model. Otherwise, provide all three target fields.
+target:
+  catalog:
+  schema:
+  model:

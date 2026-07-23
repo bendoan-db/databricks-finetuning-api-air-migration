@@ -1,0 +1,79 @@
+# Operating system files
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# Editors and local tooling
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Project-local AI assistant and MCP configuration
+.agents/
+.ai-dev-kit/
+.claude/
+.codex/
+.mcp.json
+
+# Python bytecode, environments, and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Python tooling and test caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.tox/
+.nox/
+.hypothesis/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local environment and secret files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Databricks local state
+.databricks/
+.databrickscfg
+.databricks-resources.json
+
+# Local training, experiment, and model caches
+checkpoints/
+outputs/
+wandb/
+mlruns/
+mlartifacts/
+
+# Spark local state
+derby.log
+metastore_db/
+spark-warehouse/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp

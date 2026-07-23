@@ -1,0 +1,4 @@
+interface:
+  display_name: "AIR Migrate: Generate Job"
+  short_description: "Build AIR code from vetted templates"
+  default_prompt: "Use $air-migrate-generate-air-job to materialize and customize an AI Runtime training workload from the approved templates."

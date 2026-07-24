@@ -1,4 +1,4 @@
 interface:
-  display_name: "AIR Migrate: Load UC Weights"
-  short_description: "Resolve and stage AIR training weights"
-  default_prompt: "Use $air-migrate-materialize-uc-model to apply use_existing_weights, resolve the training source, and stage any selected Unity Catalog weights."
+  display_name: "AIR Migrate: Resolve UC Weights"
+  short_description: "Reuse Volume weights or stage them through AIR"
+  default_prompt: "Use $air-migrate-materialize-uc-model to resolve input weights through a configured Volume or AIR while preserving the migration execution gate."

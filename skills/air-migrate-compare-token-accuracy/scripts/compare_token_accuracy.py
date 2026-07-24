@@ -8,11 +8,12 @@ import gc
 import hashlib
 import json
 import math
+import os
 import re
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Sequence
 
 
@@ -55,7 +56,8 @@ def _required_string(mapping: dict[str, Any], key: str, prefix: str) -> str:
     return value
 
 
-def source_model_uri(config_path: Path) -> str:
+def migration_config(config_path: Path) -> tuple[str, str]:
+    """Return the configured legacy URI and migration experiment path."""
     try:
         import yaml
     except ImportError as exc:
@@ -73,7 +75,69 @@ def source_model_uri(config_path: Path) -> str:
     version = source.get("version")
     if isinstance(version, bool) or not isinstance(version, int) or version <= 0:
         raise ValueError("source.version must be a positive integer")
-    return f"models:/{catalog}.{schema}.{model}/{version}"
+
+    experiment_path = _required_string(source, "migration_experiment_path", "source")
+    workspace_path = PurePosixPath(experiment_path)
+    if (
+        not workspace_path.is_absolute()
+        or workspace_path == PurePosixPath("/")
+        or any(part in {"", ".", ".."} for part in workspace_path.parts[1:])
+        or "\\" in experiment_path
+        or any(ord(character) < 32 for character in experiment_path)
+    ):
+        raise ValueError(
+            "source.migration_experiment_path must be an absolute Databricks "
+            "workspace path such as /Shared/fmt-migration"
+        )
+    return f"models:/{catalog}.{schema}.{model}/{version}", experiment_path
+
+
+def source_model_uri(config_path: Path) -> str:
+    """Return the exact legacy model URI declared by the migration config."""
+    return migration_config(config_path)[0]
+
+
+def migration_experiment_path(config_path: Path) -> str:
+    """Return the authoritative experiment declared by the migration config."""
+    return migration_config(config_path)[1]
+
+
+def _start_or_reuse_mlflow_run(
+    experiment_path: str,
+    *,
+    mlflow_module: Any | None = None,
+) -> tuple[Any, Any, bool]:
+    """Bind token evaluation to the configured migration experiment."""
+    if mlflow_module is None:
+        try:
+            import mlflow as mlflow_module
+        except ImportError as exc:
+            raise RuntimeError(
+                "MLflow is required to log token-accuracy evaluation"
+            ) from exc
+
+    mlflow_module.set_tracking_uri("databricks")
+    experiment = mlflow_module.set_experiment(experiment_path)
+    active_run = mlflow_module.active_run()
+    owns_active_run = False
+    if active_run is None:
+        air_managed_run_id = os.environ.get("MLFLOW_RUN_ID", "").strip()
+        if air_managed_run_id:
+            active_run = mlflow_module.start_run(run_id=air_managed_run_id)
+        else:
+            active_run = mlflow_module.start_run(
+                run_name="air-migration-token-accuracy"
+            )
+            owns_active_run = True
+    if str(active_run.info.experiment_id) != str(experiment.experiment_id):
+        if owns_active_run:
+            mlflow_module.end_run(status="FAILED")
+        raise RuntimeError(
+            "Active MLflow evaluation run belongs to experiment "
+            f"{active_run.info.experiment_id}, expected {experiment.experiment_id} "
+            f"for {experiment_path}"
+        )
+    return mlflow_module, active_run, owns_active_run
 
 
 def validate_model_uri(model_uri: str, label: str) -> str:
@@ -586,6 +650,165 @@ def _fraction(value: str) -> float:
     return parsed
 
 
+def run_evaluation(
+    args: argparse.Namespace,
+    *,
+    mlflow_module: Any | None = None,
+) -> dict[str, Any]:
+    """Evaluate both checkpoints and log the evidence to the migration run."""
+    config_path = args.config.expanduser().resolve()
+    configured_source_uri, experiment_path = migration_config(config_path)
+    legacy_uri = validate_model_uri(configured_source_uri, "configured source")
+    migrated_uri = validate_model_uri(args.migrated_model_uri, "--migrated-model-uri")
+    if legacy_uri == migrated_uri:
+        raise ValueError(
+            "Legacy and migrated model URIs must identify different versions"
+        )
+
+    output_path = args.output.expanduser().resolve()
+    if output_path.exists():
+        raise FileExistsError(f"Refusing to overwrite evaluation output: {output_path}")
+
+    mlflow, active_run, owns_active_run = _start_or_reuse_mlflow_run(
+        experiment_path,
+        mlflow_module=mlflow_module,
+    )
+    try:
+        legacy_model_path = validate_full_checkpoint(args.legacy_model_path, "legacy")
+        legacy_tokenizer_path = validate_tokenizer_path(
+            args.legacy_tokenizer_path or legacy_model_path, "legacy"
+        )
+        migrated_model_path = validate_full_checkpoint(
+            args.migrated_model_path, "migrated"
+        )
+        migrated_tokenizer_path = validate_tokenizer_path(
+            args.migrated_tokenizer_path or migrated_model_path, "migrated"
+        )
+        records, dataset_digest = load_evaluation_records(args.eval_data)
+
+        mlflow.set_tags(
+            {
+                "migration_stage": "token_accuracy_evaluation",
+                "metric_name": "assistant_response_token_accuracy",
+                "legacy_model_uri": legacy_uri,
+                "migrated_model_uri": migrated_uri,
+            }
+        )
+        mlflow.log_params(
+            {
+                "migration_experiment_path": experiment_path,
+                "evaluation_data_path": str(args.eval_data.expanduser().resolve()),
+                "evaluation_data_sha256": dataset_digest,
+                "evaluation_record_count": len(records),
+                "max_sequence_length": args.max_sequence_length,
+                "truncation": args.truncation,
+                "template_date": args.template_date,
+                "batch_size": args.batch_size,
+                "dtype": args.dtype,
+                "device": args.device,
+                "max_accuracy_regression": (
+                    args.max_accuracy_regression
+                    if args.max_accuracy_regression is not None
+                    else ""
+                ),
+            }
+        )
+
+        shared = {
+            "records": records,
+            "max_sequence_length": args.max_sequence_length,
+            "truncation": args.truncation,
+            "template_date": args.template_date,
+            "batch_size": args.batch_size,
+            "dtype": args.dtype,
+            "device": args.device,
+        }
+        legacy = score_checkpoint(
+            label="legacy",
+            model_uri=legacy_uri,
+            model_path=legacy_model_path,
+            tokenizer_path=legacy_tokenizer_path,
+            **shared,
+        )
+        migrated = score_checkpoint(
+            label="migrated",
+            model_uri=migrated_uri,
+            model_path=migrated_model_path,
+            tokenizer_path=migrated_tokenizer_path,
+            **shared,
+        )
+        comparison, risks = compare_results(
+            legacy, migrated, args.max_accuracy_regression
+        )
+
+        result = {
+            "schema_version": 1,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mlflow": {
+                "experiment_path": experiment_path,
+                "experiment_id": str(active_run.info.experiment_id),
+                "run_id": str(active_run.info.run_id),
+            },
+            "metric": {
+                "name": "assistant_response_token_accuracy",
+                "definition": (
+                    "teacher-forced correct argmax next-token predictions divided by "
+                    "scored assistant-turn tokens"
+                ),
+                "direction": "higher_is_better",
+                "assistant_turn_terminators_included": True,
+                "prompt_tokens_excluded": True,
+            },
+            "inputs": {
+                "config_path": str(config_path),
+                "evaluation_data_path": str(args.eval_data.expanduser().resolve()),
+                "evaluation_data_sha256": dataset_digest,
+                "record_count": len(records),
+            },
+            "settings": {
+                "max_sequence_length": args.max_sequence_length,
+                "truncation": args.truncation,
+                "template_date": args.template_date,
+                "batch_size": args.batch_size,
+                "dtype": args.dtype,
+                "device": args.device,
+                "deterministic_teacher_forcing": True,
+            },
+            "models": {"legacy": legacy, "migrated": migrated},
+            "comparison": comparison,
+            "risks": risks,
+        }
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        metrics = {
+            "legacy_assistant_response_token_accuracy": float(legacy["accuracy"]),
+            "migrated_assistant_response_token_accuracy": float(migrated["accuracy"]),
+            "assistant_response_token_accuracy_delta": float(
+                comparison["absolute_accuracy_delta"]
+            ),
+            "legacy_scored_tokens": int(legacy["scored_tokens"]),
+            "migrated_scored_tokens": int(migrated["scored_tokens"]),
+        }
+        if comparison["relative_accuracy_delta"] is not None:
+            metrics["assistant_response_token_accuracy_relative_delta"] = float(
+                comparison["relative_accuracy_delta"]
+            )
+        mlflow.log_metrics(metrics)
+        mlflow.set_tag("token_accuracy_verdict", comparison["verdict"])
+        mlflow.log_artifact(str(output_path), artifact_path="validation")
+    except BaseException:
+        if owns_active_run:
+            mlflow.end_run(status="FAILED")
+        raise
+    else:
+        if owns_active_run:
+            mlflow.end_run(status="FINISHED")
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("migrate/config.yaml"))
@@ -619,90 +842,7 @@ def main() -> None:
         type=_fraction,
         help="Optional allowed absolute decrease, such as 0.01 for one point",
     )
-    args = parser.parse_args()
-
-    config_path = args.config.expanduser().resolve()
-    legacy_uri = validate_model_uri(source_model_uri(config_path), "configured source")
-    migrated_uri = validate_model_uri(args.migrated_model_uri, "--migrated-model-uri")
-    if legacy_uri == migrated_uri:
-        raise ValueError(
-            "Legacy and migrated model URIs must identify different versions"
-        )
-
-    legacy_model_path = validate_full_checkpoint(args.legacy_model_path, "legacy")
-    legacy_tokenizer_path = validate_tokenizer_path(
-        args.legacy_tokenizer_path or legacy_model_path, "legacy"
-    )
-    migrated_model_path = validate_full_checkpoint(args.migrated_model_path, "migrated")
-    migrated_tokenizer_path = validate_tokenizer_path(
-        args.migrated_tokenizer_path or migrated_model_path, "migrated"
-    )
-    records, dataset_digest = load_evaluation_records(args.eval_data)
-
-    shared = {
-        "records": records,
-        "max_sequence_length": args.max_sequence_length,
-        "truncation": args.truncation,
-        "template_date": args.template_date,
-        "batch_size": args.batch_size,
-        "dtype": args.dtype,
-        "device": args.device,
-    }
-    legacy = score_checkpoint(
-        label="legacy",
-        model_uri=legacy_uri,
-        model_path=legacy_model_path,
-        tokenizer_path=legacy_tokenizer_path,
-        **shared,
-    )
-    migrated = score_checkpoint(
-        label="migrated",
-        model_uri=migrated_uri,
-        model_path=migrated_model_path,
-        tokenizer_path=migrated_tokenizer_path,
-        **shared,
-    )
-    comparison, risks = compare_results(legacy, migrated, args.max_accuracy_regression)
-
-    result = {
-        "schema_version": 1,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "metric": {
-            "name": "assistant_response_token_accuracy",
-            "definition": (
-                "teacher-forced correct argmax next-token predictions divided by "
-                "scored assistant-turn tokens"
-            ),
-            "direction": "higher_is_better",
-            "assistant_turn_terminators_included": True,
-            "prompt_tokens_excluded": True,
-        },
-        "inputs": {
-            "config_path": str(config_path),
-            "evaluation_data_path": str(args.eval_data.expanduser().resolve()),
-            "evaluation_data_sha256": dataset_digest,
-            "record_count": len(records),
-        },
-        "settings": {
-            "max_sequence_length": args.max_sequence_length,
-            "truncation": args.truncation,
-            "template_date": args.template_date,
-            "batch_size": args.batch_size,
-            "dtype": args.dtype,
-            "device": args.device,
-            "deterministic_teacher_forcing": True,
-        },
-        "models": {"legacy": legacy, "migrated": migrated},
-        "comparison": comparison,
-        "risks": risks,
-    }
-    output_path = args.output.expanduser().resolve()
-    if output_path.exists():
-        raise FileExistsError(f"Refusing to overwrite evaluation output: {output_path}")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    result = run_evaluation(parser.parse_args())
     print(json.dumps(result, indent=2, sort_keys=True))
 
 

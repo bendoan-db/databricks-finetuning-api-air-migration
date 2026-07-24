@@ -7,7 +7,7 @@ import argparse
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 
@@ -26,12 +26,57 @@ MODEL_ID_TAG_KEYS = {
 class MigrationSource:
     model_uri: str
     use_existing_weights: bool
+    run_full_migration: bool
+    migration_experiment_path: str
+    existing_weights_volume_location: str | None = None
 
 
 def _required_string(mapping: dict[str, Any], key: str, prefix: str) -> str:
     value = str(mapping.get(key, "")).strip()
     if not value:
         raise ValueError(f"{prefix}.{key} must be a non-empty string")
+    return value
+
+
+def _optional_volume_path(mapping: dict[str, Any], key: str, prefix: str) -> str | None:
+    raw_value = mapping.get(key)
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, str):
+        raise ValueError(f"{prefix}.{key} must be blank or a string")
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    path = PurePosixPath(value)
+    parts = path.parts
+    if (
+        not path.is_absolute()
+        or len(parts) < 5
+        or parts[1] != "Volumes"
+        or any(part in {"", ".", ".."} for part in parts[2:])
+    ):
+        raise ValueError(
+            f"{prefix}.{key} must use "
+            "/Volumes/<catalog>/<schema>/<volume>[/<checkpoint-path>]"
+        )
+    return str(path)
+
+
+def _migration_experiment_path(source: dict[str, Any]) -> str:
+    value = _required_string(source, "migration_experiment_path", "source")
+    path = PurePosixPath(value)
+    if (
+        not path.is_absolute()
+        or path == PurePosixPath("/")
+        or any(part in {"", ".", ".."} for part in path.parts[1:])
+        or "\\" in value
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError(
+            "source.migration_experiment_path must be an absolute Databricks "
+            "workspace path such as /Shared/fmt-migration"
+        )
     return value
 
 
@@ -56,10 +101,24 @@ def read_migration_source(config_path: Path) -> MigrationSource:
     use_existing_weights = source.get("use_existing_weights")
     if not isinstance(use_existing_weights, bool):
         raise ValueError("source.use_existing_weights must be true or false")
+    run_full_migration = source.get("run_full_migration")
+    if not isinstance(run_full_migration, bool):
+        raise ValueError("source.run_full_migration must be true or false")
+    existing_weights_volume_location = _optional_volume_path(
+        source, "existing_weights_volume_location", "source"
+    )
+    if existing_weights_volume_location and not use_existing_weights:
+        raise ValueError(
+            "source.existing_weights_volume_location requires "
+            "source.use_existing_weights=true"
+        )
 
     return MigrationSource(
         model_uri=f"models:/{catalog}.{schema}.{model}/{version}",
         use_existing_weights=use_existing_weights,
+        run_full_migration=run_full_migration,
+        migration_experiment_path=_migration_experiment_path(source),
+        existing_weights_volume_location=existing_weights_volume_location,
     )
 
 
@@ -137,12 +196,38 @@ def resolve_training_source(
         raise ValueError("base_model_id must be a non-empty Hugging Face model ID")
 
     if migration_source.use_existing_weights:
+        if migration_source.existing_weights_volume_location:
+            return {
+                "use_existing_weights": True,
+                "run_full_migration": migration_source.run_full_migration,
+                "migration_experiment_path": (
+                    migration_source.migration_experiment_path
+                ),
+                "model_source": "existing_uc",
+                "source_model_uri": migration_source.model_uri,
+                "base_model_id": model_id,
+                "existing_weights_volume_location": (
+                    migration_source.existing_weights_volume_location
+                ),
+                "model_name": migration_source.existing_weights_volume_location,
+                "tokenizer_path": migration_source.existing_weights_volume_location,
+                "requires_materialization": False,
+                "requires_volume_validation": True,
+                "requires_hf_token": False,
+                "match_basis": (
+                    "migrate.config.source.existing_weights_volume_location"
+                ),
+            }
         return {
             "use_existing_weights": True,
+            "run_full_migration": migration_source.run_full_migration,
+            "migration_experiment_path": migration_source.migration_experiment_path,
             "model_source": "existing_uc",
             "source_model_uri": migration_source.model_uri,
             "base_model_id": model_id,
+            "existing_weights_volume_location": None,
             "requires_materialization": True,
+            "requires_volume_validation": False,
             "requires_hf_token": False,
             "match_basis": "migrate.config.source",
         }
@@ -176,12 +261,16 @@ def resolve_training_source(
     if not matches:
         return {
             "use_existing_weights": False,
+            "run_full_migration": migration_source.run_full_migration,
+            "migration_experiment_path": migration_source.migration_experiment_path,
             "model_source": "hugging_face",
             "source_model_uri": None,
             "base_model_id": model_id,
             "model_name": model_id,
             "tokenizer_path": None,
+            "existing_weights_volume_location": None,
             "requires_materialization": False,
+            "requires_volume_validation": False,
             "requires_hf_token": True,
             "match_basis": "no_system_ai_match",
         }
@@ -199,10 +288,14 @@ def resolve_training_source(
     version = _latest_ready_version(client, model_name)
     return {
         "use_existing_weights": False,
+        "run_full_migration": migration_source.run_full_migration,
+        "migration_experiment_path": migration_source.migration_experiment_path,
         "model_source": "system_ai",
         "source_model_uri": f"models:/{model_name}/{version}",
         "base_model_id": model_id,
+        "existing_weights_volume_location": None,
         "requires_materialization": True,
+        "requires_volume_validation": False,
         "requires_hf_token": False,
         "match_basis": match_basis,
     }

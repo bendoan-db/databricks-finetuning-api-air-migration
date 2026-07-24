@@ -1,4 +1,4 @@
 interface:
   display_name: "AIR Migrate: Orchestrate FMT Model"
   short_description: "Orchestrate an FMT-to-AIR migration"
-  default_prompt: "Use $air-migrate-migrate-fmt-model to migrate a legacy fine-tuned model to a template-based AI Runtime workflow."
+  default_prompt: "Use $air-migrate-migrate-fmt-model to migrate the configured model while enforcing its preparation-only or full-migration execution gate."

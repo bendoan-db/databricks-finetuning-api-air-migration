@@ -1,4 +1,4 @@
 interface:
   display_name: "AIR Migrate: Validate Model"
   short_description: "Compare legacy and migrated models"
-  default_prompt: "Use $air-migrate-validate-model-migration to smoke-test an AI Runtime workload and compare its model with the legacy source."
+  default_prompt: "Use $air-migrate-validate-model-migration to run the preflight or final validation scope authorized by the migration config."

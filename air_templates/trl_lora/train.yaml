@@ -1,0 +1,121 @@
+# Llama 3.1 8B Instruct supervised fine-tuning with TRL and plain LoRA on
+# Databricks AI Runtime.
+#
+# Before running, update the Unity Catalog paths and, for remote gated models,
+# the HF_TOKEN secret below.
+# From this directory, submit with:
+#   air run --file train.yaml --watch
+
+# Generated migrations replace both experiment fields with the required
+# migrate/config.yaml source.migration_experiment_path.
+experiment_name: /Shared/llama31_8b_instruct_trl_lora
+
+environment:
+  version: '5'
+  dependencies:
+    - 'trl==0.27.1'
+    - 'peft>=0.17,<0.19'
+    - 'transformers>=4.56,<5'
+    - 'datasets>=3.0,<5'
+    - 'accelerate>=1.4,<2'
+    - 'mlflow>=3.6,<4'
+    - 'pyyaml>=6.0'
+    - 'safetensors>=0.4'
+    - 'hf-transfer==0.1.9'
+
+# Generated migrations replace this block from migrate/config.yaml and keep the
+# torchrun process count below synchronized with num_accelerators.
+compute:
+  num_accelerators: 8
+  accelerator_type: GPU_8xH100
+
+env_variables:
+  HF_MLFLOW_LOG_ARTIFACTS: 'false'
+  MLFLOW_FLATTEN_PARAMS: 'true'
+  TOKENIZERS_PARALLELISM: 'false'
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: '1'
+
+# AI Runtime injects this Databricks secret into the workload as HF_TOKEN.
+secrets:
+  HF_TOKEN: doan/hf_token
+
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: .
+
+command: torchrun --nproc_per_node=8 $CODE_SOURCE_PATH/train.py
+
+parameters:
+  training_config:
+    # Generated migrations set this from migrate/config.yaml. When true,
+    # model_name/tokenizer_path must be the materialized configured UC version.
+    use_existing_weights: false
+    model_source: hugging_face  # existing_uc | system_ai | hugging_face
+    source_model_uri:
+    model_name: meta-llama/Meta-Llama-3.1-8B-Instruct
+    # existing_uc/system_ai sources set these to worker-readable Volume paths.
+    tokenizer_path:
+    # Volume-backed model/tokenizer directories are copied once per AIR node to
+    # ephemeral local storage before Transformers loads them. Outputs remain in
+    # Unity Catalog Volumes. Use a node-local path with enough free capacity.
+    local_model_cache_dir: /tmp/air-model-cache
+    local_model_cache_copy_workers: 8
+    experiment_path: /Shared/llama31_8b_instruct_trl_lora
+    mlflow_run_name: llama31-8b-instruct-trl-lora
+    # The runner merges the PEFT adapter into the unquantized base model and
+    # registers that full checkpoint here. The catalog/schema must exist.
+    registered_model_name: doan.ft_api_migration.llama31_8b_instruct_trl_lora
+
+    # JSONL records must have OpenAI-style `messages` arrays. Every assistant
+    # turn is expanded into a conversational prompt/completion training record.
+    # These defaults consume files produced by example_setup/02_stage_data.
+    train_data_path: /Volumes/doan/ft_api_migration/finetuning_api/tabformer_fraud/train.jsonl
+    eval_data_path: /Volumes/doan/ft_api_migration/finetuning_api/tabformer_fraud/eval.jsonl
+    output_dir: /Volumes/doan/ft_api_migration/finetuning_api/trl_lora/llama31_8b_instruct
+    merged_output_dir: /Volumes/doan/ft_api_migration/finetuning_api/trl_lora/llama31_8b_instruct_merged
+
+    # Each rank holds one unquantized bf16 base-model replica. DDP synchronizes
+    # only the trainable LoRA parameters.
+    sequence_len: 2048
+    packing: false
+    assistant_only_loss: true
+
+    per_device_train_batch_size: 24
+    per_device_eval_batch_size: 24
+    gradient_accumulation_steps: 4
+    num_epochs: 10
+    max_steps:
+    learning_rate: 2.0e-4
+    optimizer: adamw_torch_fused
+    lr_scheduler: cosine
+    warmup_ratio: 0.1
+    weight_decay: 0.0
+    max_grad_norm: 1.0
+    logging_steps: 1
+    eval_strategy: epoch
+    save_strategy: epoch
+    save_total_limit: 2
+    resume_from_checkpoint:
+
+    lora_r: 32
+    lora_alpha: 16
+    lora_dropout: 0.05
+    lora_target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+    gradient_checkpointing: true
+    gradient_checkpointing_use_reentrant: false
+    bf16: true
+    tf32: true
+    attn_implementation: sdpa
+    ddp_find_unused_parameters: false
+    dataset_num_proc: 1
+    dataloader_num_workers: 2
+    seed: 42

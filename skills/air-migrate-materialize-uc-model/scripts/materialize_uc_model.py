@@ -7,7 +7,7 @@ import argparse
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -81,6 +81,43 @@ def use_existing_weights_from_config(config_path: Path) -> bool:
     if not isinstance(value, bool):
         raise ValueError("source.use_existing_weights must be true or false")
     return value
+
+
+def existing_weights_volume_from_config(config_path: Path) -> str | None:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required when using --config") from exc
+
+    with config_path.expanduser().open("r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    if not isinstance(payload, dict) or not isinstance(payload.get("source"), dict):
+        raise ValueError(f"Expected a source mapping in {config_path}")
+
+    raw_value = payload["source"].get("existing_weights_volume_location")
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, str):
+        raise ValueError(
+            "source.existing_weights_volume_location must be blank or a string"
+        )
+    value = raw_value.strip()
+    if not value:
+        return None
+
+    path = PurePosixPath(value)
+    parts = path.parts
+    if (
+        not path.is_absolute()
+        or len(parts) < 5
+        or parts[1] != "Volumes"
+        or any(part in {"", ".", ".."} for part in parts[2:])
+    ):
+        raise ValueError(
+            "source.existing_weights_volume_location must use "
+            "/Volumes/<catalog>/<schema>/<volume>[/<checkpoint-path>]"
+        )
+    return str(path)
 
 
 def reference_from_uri(model_uri: str) -> ModelReference:
@@ -188,7 +225,9 @@ def _model_score(path: Path, root: Path, inventory: WeightInventory) -> int:
     return score - relative_depth
 
 
-def select_model_path(root: Path, checkpoint_subpath: str | None) -> tuple[Path, WeightInventory]:
+def select_model_path(
+    root: Path, checkpoint_subpath: str | None
+) -> tuple[Path, WeightInventory]:
     if checkpoint_subpath:
         model_path = _resolve_subpath(root, checkpoint_subpath, "checkpoint subpath")
         return model_path, _validate_model_path(model_path)
@@ -200,7 +239,9 @@ def select_model_path(root: Path, checkpoint_subpath: str | None) -> tuple[Path,
             inventory = _validate_model_path(model_path)
         except (FileNotFoundError, ValueError):
             continue
-        candidates.append((_model_score(model_path, root, inventory), model_path, inventory))
+        candidates.append(
+            (_model_score(model_path, root, inventory), model_path, inventory)
+        )
 
     if not candidates:
         raise FileNotFoundError(
@@ -208,7 +249,11 @@ def select_model_path(root: Path, checkpoint_subpath: str | None) -> tuple[Path,
         )
     candidates.sort(key=lambda item: (-item[0], str(item[1])))
     if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
-        tied = ", ".join(str(item[1].relative_to(root)) for item in candidates if item[0] == candidates[0][0])
+        tied = ", ".join(
+            str(item[1].relative_to(root))
+            for item in candidates
+            if item[0] == candidates[0][0]
+        )
         raise ValueError(
             "Multiple checkpoint directories are equally plausible; pass "
             f"--checkpoint-subpath after reviewing them: {tied}"
@@ -259,7 +304,9 @@ def select_tokenizer_path(
         key=lambda item: (-item[0], str(item[1])),
     )
     if len(ranked) > 1 and ranked[0][0] == ranked[1][0]:
-        tied = ", ".join(str(item[1].relative_to(root)) for item in ranked if item[0] == ranked[0][0])
+        tied = ", ".join(
+            str(item[1].relative_to(root)) for item in ranked if item[0] == ranked[0][0]
+        )
         raise ValueError(
             "Multiple tokenizer directories are equally plausible; pass "
             f"--tokenizer-subpath after reviewing them: {tied}"
@@ -283,9 +330,10 @@ def _prepare_destination(output_dir: Path, reuse_existing: bool) -> Path:
 
 def _validate_volume_path(path: Path) -> None:
     parts = path.parts
-    if len(parts) < 6 or parts[1] != "Volumes":
+    if len(parts) < 5 or parts[1] != "Volumes":
         raise ValueError(
-            "--require-volume needs /Volumes/<catalog>/<schema>/<volume>/<path>"
+            "--require-volume needs "
+            "/Volumes/<catalog>/<schema>/<volume>[/<checkpoint-path>]"
         )
 
 
@@ -317,6 +365,7 @@ def materialize(
     tokenizer_subpath: str | None = None,
     reuse_existing: bool = False,
     require_volume: bool = False,
+    verify_model_version: bool = True,
     mlflow_module: Any | None = None,
 ) -> dict[str, Any]:
     if purpose not in {
@@ -327,17 +376,26 @@ def materialize(
         raise ValueError(
             "purpose must be base_model_initialization, continue_training, or validation"
         )
-    mlflow = mlflow_module or _import_mlflow()
-    mlflow.set_registry_uri(registry_uri)
-    client = mlflow.tracking.MlflowClient()
-    model_version = client.get_model_version(
-        name=reference.name, version=str(reference.version)
-    )
-    status = _status_text(getattr(model_version, "status", None))
-    if status is not None and status != "READY":
-        raise RuntimeError(
-            f"Registered model version is not ready: {reference.uri} ({status})"
+    if not verify_model_version and not reuse_existing:
+        raise ValueError(
+            "verify_model_version can be false only for existing checkpoint validation"
         )
+
+    mlflow = None
+    model_version = None
+    status = None
+    if verify_model_version:
+        mlflow = mlflow_module or _import_mlflow()
+        mlflow.set_registry_uri(registry_uri)
+        client = mlflow.tracking.MlflowClient()
+        model_version = client.get_model_version(
+            name=reference.name, version=str(reference.version)
+        )
+        status = _status_text(getattr(model_version, "status", None))
+        if status is not None and status != "READY":
+            raise RuntimeError(
+                f"Registered model version is not ready: {reference.uri} ({status})"
+            )
 
     destination = _prepare_destination(output_dir, reuse_existing)
     if require_volume:
@@ -366,9 +424,7 @@ def materialize(
                 "MLflow downloaded outside the requested destination; refusing the result"
             )
 
-    model_path, inventory = select_model_path(
-        downloaded_root, checkpoint_subpath
-    )
+    model_path, inventory = select_model_path(downloaded_root, checkpoint_subpath)
     tokenizer_path = select_tokenizer_path(
         downloaded_root, model_path, tokenizer_subpath
     )
@@ -385,7 +441,11 @@ def materialize(
         "purpose": purpose,
         "registry_uri": registry_uri,
         "source_model_uri": reference.uri,
-        "artifact_uri": resolved_artifact_uri,
+        "artifact_uri": resolved_artifact_uri if verify_model_version else None,
+        "acquisition": "provided_volume" if reuse_existing else "uc_download",
+        "download_performed": not reuse_existing,
+        "provided_volume_location": str(destination) if reuse_existing else None,
+        "model_version_checked": verify_model_version,
         "source_run_id": (
             str(getattr(model_version, "run_id"))
             if getattr(model_version, "run_id", None) is not None
@@ -398,6 +458,7 @@ def materialize(
         ),
         "model_version_status": status,
         "destination": str(destination),
+        "checkpoint_root": str(downloaded_root),
         "downloaded_artifact_path": str(downloaded_root),
         "model_path": str(model_path),
         "tokenizer_path": str(tokenizer_path),
@@ -453,6 +514,35 @@ def main() -> None:
         if args.model_uri
         else reference_from_config(args.config)
     )
+    provided_volume = (
+        existing_weights_volume_from_config(args.config) if args.config else None
+    )
+    if provided_volume:
+        if not use_existing_weights_from_config(args.config):
+            raise ValueError(
+                "source.existing_weights_volume_location requires "
+                "source.use_existing_weights=true"
+            )
+        if not args.reuse_existing:
+            raise ValueError(
+                "source.existing_weights_volume_location is populated; skip UC "
+                "download and validate that checkpoint with --reuse-existing"
+            )
+        if args.output_dir.expanduser().resolve() != Path(provided_volume).resolve():
+            raise ValueError(
+                "--output-dir must equal source.existing_weights_volume_location "
+                "when validating provided weights"
+            )
+        if args.artifact_uri:
+            raise ValueError(
+                "--artifact-uri cannot be used with provided Volume weights because "
+                "no artifact download occurs"
+            )
+        if args.checkpoint_subpath or args.tokenizer_subpath:
+            raise ValueError(
+                "source.existing_weights_volume_location must point directly to the "
+                "complete model and tokenizer checkpoint; do not pass subpaths"
+            )
     if (
         args.config
         and args.purpose == "continue_training"
@@ -473,10 +563,11 @@ def main() -> None:
         purpose=args.purpose,
         registry_uri=args.registry_uri,
         artifact_uri=args.artifact_uri,
-        checkpoint_subpath=args.checkpoint_subpath,
-        tokenizer_subpath=args.tokenizer_subpath,
+        checkpoint_subpath="." if provided_volume else args.checkpoint_subpath,
+        tokenizer_subpath="." if provided_volume else args.tokenizer_subpath,
         reuse_existing=args.reuse_existing,
         require_volume=args.require_volume,
+        verify_model_version=not bool(provided_volume),
     )
     output = json.dumps(result, indent=2, sort_keys=True)
     if args.metadata_output:

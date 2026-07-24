@@ -12,7 +12,7 @@ Score the model with teacher forcing over complete chat records. Exclude system 
 
 The metric is deterministic for fixed weights, tokenizer files, chat template, template arguments, input records, sequence-length policy, and inference implementation. It does not run generation or use sampling parameters.
 
-This is not an output-level MLflow GenAI scorer. It requires local checkpoint logits and aggregate token counts; `mlflow.genai.evaluate()` operates on generated outputs or traces. A parent validation run may log the resulting JSON as an artifact and mirror the aggregate accuracies as MLflow metrics, but it must not replace weighted counts with an unweighted mean of per-record scorer values.
+This is not an output-level MLflow GenAI scorer. It requires local checkpoint logits and aggregate token counts; `mlflow.genai.evaluate()` operates on generated outputs or traces. The evaluator must create or reuse a run in `source.migration_experiment_path`, log the resulting JSON as an artifact, and mirror the token-weighted aggregate accuracies as MLflow metrics. It must not replace weighted counts with an unweighted mean of per-record scorer values.
 
 ## Shared-input requirements
 
@@ -43,6 +43,11 @@ The evaluator writes this stable top-level structure:
 {
   "schema_version": 1,
   "generated_at": "2026-07-23T00:00:00+00:00",
+  "mlflow": {
+    "experiment_path": "/Shared/fmt-migration",
+    "experiment_id": "456",
+    "run_id": "abc123"
+  },
   "metric": {
     "name": "assistant_response_token_accuracy",
     "direction": "higher_is_better"
@@ -98,3 +103,5 @@ Stop without writing a result when:
 - inference fails or either model produces zero scored tokens.
 
 Treat out-of-memory errors as execution failures. Change batch size or compute and rerun to a new evidence path; do not silently reduce the dataset.
+
+When the evaluator owns its MLflow run, mark that run failed before propagating an error. When AIR or a parent context injected the active run, require its experiment ID to match and let that owner record terminal status.

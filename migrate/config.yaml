@@ -4,9 +4,24 @@ source:
   schema: ft_api_migration
   model: tabformer_fraud_classifier
   version: 2
+  # Required MLflow workspace experiment for every migration AIR submission and
+  # application-created run. The migration creates it when it does not exist.
+  migration_experiment_path: /Users/ben.doan@databricks.com/air-migration
+  # use_existing_weights
   # true: continue training from this exact UC version.
   # false: retrain from the original base model, preferring system.ai and then HF.
   use_existing_weights: true
+  # Optional complete Hugging Face model/tokenizer checkpoint directory under
+  # /Volumes/<catalog>/<schema>/<volume>. When populated, load it directly and
+  # skip UC model materialization. Leave blank when use_existing_weights=false.
+  existing_weights_volume_location:
+  # Required execution gate for the migration pipeline.
+  # true: run training, any required LoRA merge, registration, model evaluation,
+  # and final validation after preparation succeeds.
+  # false: resolve or materialize the input weights, generate the AIR workload,
+  # run preflight validation, and stop without training, merge, registration, or
+  # model evaluation. Required AIR source materialization is still submitted.
+  run_full_migration: true
 
 # Leave all target fields blank to register the migrated model as a new version
 # of the source model. Otherwise, provide all three target fields.
@@ -14,3 +29,10 @@ target:
   catalog:
   schema:
   model:
+  volume:
+
+# Authoritative AIR job resources. Supported accelerator types are
+# GPU_1xA10, GPU_1xH100, and GPU_8xH100; num_accelerators must match the type.
+compute:
+  num_accelerators: 8
+  accelerator_type: GPU_8xH100

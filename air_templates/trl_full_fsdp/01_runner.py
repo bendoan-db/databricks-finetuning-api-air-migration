@@ -1,16 +1,18 @@
 # Databricks notebook source
+# ruff: noqa: E402,F821
 # MAGIC %md
-# MAGIC # Full fine-tune Llama 3.1 8B Instruct with Axolotl and FSDP
+# MAGIC # Full fine-tune Llama 3.1 8B Instruct with TRL SFTTrainer and FSDP
 # MAGIC
-# MAGIC This notebook runs the same `train.py` and `train.yaml` used by the AI
-# MAGIC Runtime CLI. Attach it to **Serverless GPU**, select **8xH100**, and use
-# MAGIC the **AI v5** environment. The default data paths consume the JSONL files
-# MAGIC produced by `example_setup/02_stage_data`.
+# MAGIC This notebook runs the same `train.py`, utility modules, and `train.yaml`
+# MAGIC used by the AI Runtime CLI. Attach it to **Serverless GPU** with the accelerator in
+# MAGIC `train.yaml` and use the configured AI environment. The default data
+# MAGIC paths consume the JSONL files produced by `example_setup/02_stage_data`.
 
 # COMMAND ----------
 
-# MAGIC %pip install --no-build-isolation "axolotl[flash-attn]==0.13.1"
-# MAGIC %pip install "trl==0.27.1" "torchao==0.16.0" "mlflow>=3.6,<4" "pyyaml>=6.0"
+# MAGIC %pip install "trl==0.27.1" "transformers>=4.56,<5" "datasets>=3.0,<5"
+# MAGIC %pip install "accelerate>=1.4,<2" "mlflow>=3.6,<4" "pyyaml>=6.0"
+# MAGIC %pip install "safetensors>=0.4" "hf-transfer==0.1.9"
 
 # COMMAND ----------
 
@@ -40,11 +42,20 @@ def find_project_dir() -> Path:
         )
 
     for candidate in dict.fromkeys(candidates):
-        if (candidate / "train.py").is_file() and (candidate / "train.yaml").is_file():
+        if all(
+            (candidate / name).is_file()
+            for name in (
+                "train.py",
+                "train.yaml",
+                "helper_utils.py",
+                "training_utils.py",
+            )
+        ):
             return candidate
     searched = ", ".join(str(candidate) for candidate in candidates)
     raise FileNotFoundError(
-        f"Could not find train.py and train.yaml; searched: {searched}"
+        "Could not find train.py, train.yaml, helper_utils.py, and "
+        f"training_utils.py; searched: {searched}"
     )
 
 
@@ -53,7 +64,7 @@ CONFIG_PATH = PROJECT_DIR / "train.yaml"
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from train import load_training_config, register_trained_model
+from helper_utils import load_training_config
 
 
 training_config, _ = load_training_config(CONFIG_PATH)
@@ -62,11 +73,15 @@ print(f"Model: {training_config['model_name']}")
 print(f"Model source: {training_config['model_source']}")
 print(f"Use existing weights: {training_config['use_existing_weights']}")
 print(f"Source model URI: {training_config.get('source_model_uri')}")
-print(f"Tokenizer: {training_config.get('tokenizer_path') or training_config['model_name']}")
+print(f"Migration experiment: {training_config['experiment_path']}")
+print(
+    f"Tokenizer: {training_config.get('tokenizer_path') or training_config['model_name']}"
+)
+print(f"Node-local model cache: {training_config['local_model_cache_dir']}")
+print(f"Cache copy workers: {training_config['local_model_cache_copy_workers']}")
 print(f"Training data: {training_config['train_data_path']}")
 print(f"Evaluation data: {training_config['eval_data_path']}")
 print(f"Full-model output: {training_config['output_dir']}")
-print(f"UC model target: {training_config['registered_model_name']}")
 
 # COMMAND ----------
 
@@ -103,7 +118,15 @@ if requires_hf_token and not HF_TOKEN:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Launch distributed training
+# MAGIC ## Launch distributed TRL SFT training
+# MAGIC
+# MAGIC `SFTTrainer` updates every model parameter. FSDP full-shards parameters,
+# MAGIC gradients, and optimizer state, while FSDP activation checkpointing
+# MAGIC reduces activation memory without redundant parameter all-gathers.
+# MAGIC Every assistant turn is trained as a conversational completion, so
+# MAGIC prompt tokens remain masked from loss. Volume-backed model and tokenizer
+# MAGIC files are copied once per node into the ephemeral local cache configured
+# MAGIC in `train.yaml` before FSDP initializes the model.
 
 # COMMAND ----------
 
@@ -115,16 +138,35 @@ from serverless_gpu.launcher import distributed
 with CONFIG_PATH.open("r", encoding="utf-8") as handle:
     workload = yaml.safe_load(handle)
 
-num_gpus = int(workload["compute"]["num_accelerators"])
-accelerator_type = workload["compute"]["accelerator_type"]
-if num_gpus != 8 or accelerator_type != "GPU_8xH100":
+supported_air_accelerators = {
+    "GPU_1xA10": (1, "A10"),
+    "GPU_1xH100": (1, "H100"),
+    "GPU_8xH100": (8, "H100"),
+}
+compute = workload.get("compute")
+if not isinstance(compute, dict):
+    raise ValueError("train.yaml compute must be a mapping")
+num_gpus = compute.get("num_accelerators")
+accelerator_type = compute.get("accelerator_type")
+if isinstance(num_gpus, bool) or not isinstance(num_gpus, int) or num_gpus <= 0:
+    raise ValueError("compute.num_accelerators must be a positive integer")
+accelerator_specification = supported_air_accelerators.get(accelerator_type)
+if accelerator_specification is None:
+    supported = ", ".join(sorted(supported_air_accelerators))
     raise ValueError(
-        "This runner expects compute.num_accelerators=8 and "
-        "compute.accelerator_type=GPU_8xH100"
+        f"Unsupported compute.accelerator_type={accelerator_type!r}; "
+        f"supported values: {supported}"
     )
+expected_gpus, gpu_type_name = accelerator_specification
+if num_gpus != expected_gpus:
+    raise ValueError(
+        f"compute.accelerator_type={accelerator_type!r} requires "
+        f"num_accelerators={expected_gpus}, got {num_gpus}"
+    )
+gpu_type = getattr(GPUType, gpu_type_name)
 
 
-@distributed(gpus=num_gpus, gpu_type=GPUType.H100)
+@distributed(gpus=num_gpus, gpu_type=gpu_type)
 def run_training_job(config_path: str, hf_token: str | None):
     import os
     import sys
@@ -156,35 +198,14 @@ rank_zero_result
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Register the model in Unity Catalog
-# MAGIC
-# MAGIC The target is read from `training_config.registered_model_name` in
-# MAGIC `train.yaml`. The runner logs the portable final checkpoint to the
-# MAGIC training MLflow run and creates a new UC model version. Axolotl
-# MAGIC checkpoint directories and optimizer state are excluded. The caller
-# MAGIC needs `USE CATALOG`, `USE SCHEMA`, and permission to create or update
-# MAGIC the configured registered model.
-
-# COMMAND ----------
-
-registered_model = register_trained_model(
-    training_result=rank_zero_result,
-    config_path=CONFIG_PATH,
-)
-print(f"Registered model: {registered_model['model_uri']}")
-registered_model
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC The resulting directory contains the fully fine-tuned model weights,
-# MAGIC tokenizer, configuration, and Axolotl checkpoints. FSDP gathers a full
+# MAGIC tokenizer, configuration, and Trainer checkpoints. FSDP gathers a full
 # MAGIC state dict so the final output can be loaded without an adapter or a
-# MAGIC distributed checkpoint merger. The runner registers the portable final
-# MAGIC files with MLflow's Transformers flavor in Unity Catalog. For remote
-# MAGIC gated models, edit the `HF_TOKEN` secret reference in `train.yaml`;
-# MAGIC materialized local model/tokenizer paths do not require it. Submit the
-# MAGIC same training workload from a terminal with:
+# MAGIC distributed checkpoint merger. Run `02_register_uc` with the MLflow run
+# MAGIC ID printed above to log the portable final files and register them in
+# MAGIC Unity Catalog. For remote gated models, edit the `HF_TOKEN` secret
+# MAGIC reference in `train.yaml`; materialized local model/tokenizer paths do
+# MAGIC not require it. Submit the same training workload from a terminal with:
 # MAGIC
 # MAGIC ```bash
 # MAGIC air run --file train.yaml --watch

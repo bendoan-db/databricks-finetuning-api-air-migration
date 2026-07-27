@@ -26,6 +26,7 @@ from pathlib import Path
 
 
 def find_project_dir() -> Path:
+    """Locate the generated AIR project directory in local or notebook contexts."""
     candidates = []
     if "__file__" in globals():
         candidates.append(Path(__file__).resolve().parent)
@@ -64,14 +65,13 @@ CONFIG_PATH = PROJECT_DIR / "train.yaml"
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from helper_utils import load_training_config
+from helper_utils import _needs_hf_token, load_training_config
 
 
 training_config, _ = load_training_config(CONFIG_PATH)
 print(f"Configuration: {CONFIG_PATH}")
-print(f"Model: {training_config['model_name']}")
 print(f"Model source: {training_config['model_source']}")
-print(f"Use existing weights: {training_config['use_existing_weights']}")
+print(f"Configured model: {training_config['model_name']}")
 print(f"Source model URI: {training_config.get('source_model_uri')}")
 print(f"Migration experiment: {training_config['experiment_path']}")
 print(
@@ -87,34 +87,33 @@ print(f"Merged output: {training_config['merged_output_dir']}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Configure Hugging Face access
+# MAGIC ## Configure gated Hugging Face access
 # MAGIC
-# MAGIC Hugging Face sources can require a token. Existing UC and `system.ai`
-# MAGIC sources available through UC Volume paths do not. If `HF_TOKEN` is
-# MAGIC already defined in the notebook environment, it is used instead.
+# MAGIC This step is skipped for Volume, `system.ai`, and public Hugging Face
+# MAGIC inputs. For a gated Hugging Face repository, the generated workload's
+# MAGIC `HF_TOKEN` secret reference is fetched without exposing the token.
 
 # COMMAND ----------
 
-dbutils.widgets.text("hf_secret_scope", "your-secret-scope", "HF secret scope")
-dbutils.widgets.text("hf_secret_key", "hf_token", "HF secret key")
+import yaml
+
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
-model_references = [training_config["model_name"]]
-if training_config.get("tokenizer_path"):
-    model_references.append(training_config["tokenizer_path"])
-requires_hf_token = any(
-    not Path(str(reference)).expanduser().is_absolute()
-    for reference in model_references
-)
-if requires_hf_token and not HF_TOKEN:
-    secret_scope = dbutils.widgets.get("hf_secret_scope").strip()
-    secret_key = dbutils.widgets.get("hf_secret_key").strip()
-    if not secret_scope or secret_scope == "your-secret-scope" or not secret_key:
+if _needs_hf_token(training_config) and not HF_TOKEN:
+    with CONFIG_PATH.open("r", encoding="utf-8") as handle:
+        workload = yaml.safe_load(handle)
+    secret_reference = str((workload.get("secrets") or {}).get("HF_TOKEN", ""))
+    if "/" not in secret_reference:
         raise ValueError(
-            "Set hf_secret_scope/hf_secret_key to a Databricks secret containing "
-            "a Hugging Face token, or provide HF_TOKEN in the environment."
+            "A gated Hugging Face source requires secrets.HF_TOKEN as <scope>/<key>"
         )
-    HF_TOKEN = dbutils.secrets.get(scope=secret_scope, key=secret_key)
+    default_scope, default_key = secret_reference.split("/", 1)
+    dbutils.widgets.text("hf_secret_scope", default_scope, "HF secret scope")
+    dbutils.widgets.text("hf_secret_key", default_key, "HF secret key")
+    HF_TOKEN = dbutils.secrets.get(
+        scope=dbutils.widgets.get("hf_secret_scope").strip(),
+        key=dbutils.widgets.get("hf_secret_key").strip(),
+    )
 
 # COMMAND ----------
 
@@ -125,9 +124,9 @@ if requires_hf_token and not HF_TOKEN:
 # MAGIC Accelerate full-shards the unquantized base model with a PEFT-aware FSDP
 # MAGIC wrapping policy. FSDP activation checkpointing reduces activation
 # MAGIC memory. Each assistant turn is trained as a conversational completion,
-# MAGIC so prompt tokens remain masked from loss. Volume-backed model and
-# MAGIC tokenizer files are copied once per node into the ephemeral local cache
-# MAGIC configured in `train.yaml` before FSDP initializes the model.
+# MAGIC so prompt tokens remain masked from loss. Volume inputs are copied and
+# MAGIC system.ai artifacts are downloaded once per node into the local cache;
+# MAGIC Hugging Face inputs are downloaded by Transformers.
 
 # COMMAND ----------
 
@@ -169,6 +168,7 @@ gpu_type = getattr(GPUType, gpu_type_name)
 
 @distributed(gpus=num_gpus, gpu_type=gpu_type)
 def run_training_job(config_path: str, hf_token: str | None):
+    """Run LoRA FSDP training on one AIR distributed worker."""
     import os
     import sys
     from pathlib import Path
@@ -178,10 +178,9 @@ def run_training_job(config_path: str, hf_token: str | None):
         sys.path.insert(0, str(project_dir))
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
-
     from train import run_training
 
-    return run_training(config_path=config_path)
+    return run_training(config_path=config_path, hf_token=hf_token)
 
 
 distributed_results = run_training_job.distributed(str(CONFIG_PATH), HF_TOKEN)
@@ -204,14 +203,15 @@ rank_zero_result
 # MAGIC The merge reloads the unquantized base model, applies the trained
 # MAGIC adapter with PEFT's safe merge, and writes portable sharded
 # MAGIC safetensors to `training_config.merged_output_dir`. The destination
-# MAGIC must be an empty UC Volume directory. Volume-backed base weights use the
-# MAGIC same node-local staging path before the merge loads them.
+# MAGIC must be an empty UC Volume directory. Volume and system.ai base weights
+# MAGIC use the same node-local staging path before the merge loads them.
 
 # COMMAND ----------
 
 
 @distributed(gpus=num_gpus, gpu_type=gpu_type)
 def run_merge_job(config_path: str, hf_token: str | None):
+    """Merge LoRA FSDP adapter weights on one AIR distributed worker."""
     import os
     import sys
     from pathlib import Path
@@ -221,7 +221,6 @@ def run_merge_job(config_path: str, hf_token: str | None):
         sys.path.insert(0, str(project_dir))
     if hf_token:
         os.environ["HF_TOKEN"] = hf_token
-
     from training_utils import merge_peft_model
 
     return merge_peft_model(config_path=config_path)
@@ -245,9 +244,8 @@ rank_zero_merge
 # MAGIC and resumable Trainer checkpoints. The separate merged directory contains
 # MAGIC full model weights with the adapter applied. Run `02_register_uc` with
 # MAGIC the MLflow run ID printed above to register those weights in Unity
-# MAGIC Catalog. For remote gated models, edit the `HF_TOKEN` secret reference
-# MAGIC in `train.yaml`; local model/tokenizer paths do not require it. Submit
-# MAGIC the same training workload from a terminal with:
+# MAGIC Catalog. Model weights come from the selected Volume, `system.ai`, or
+# MAGIC Hugging Face source. Submit the same training workload from a terminal with:
 # MAGIC
 # MAGIC ```bash
 # MAGIC air run --file train.yaml --watch

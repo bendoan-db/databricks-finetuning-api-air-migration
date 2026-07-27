@@ -6,12 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 
 MODEL_URI_PATTERN = re.compile(r"^models:/([^/]+)/([1-9][0-9]*)$")
+DEFAULT_LOCAL_STAGING_ROOT = Path("/tmp")
 TOKENIZER_ASSETS = {
     "tokenizer.json",
     "tokenizer.model",
@@ -347,6 +350,102 @@ def _import_mlflow() -> Any:
     return mlflow
 
 
+def _validate_local_staging_root(path: Path, destination: Path) -> Path:
+    root = path.expanduser().resolve()
+    forbidden_roots = tuple(
+        candidate.resolve()
+        for candidate in (Path("/Volumes"), Path("/dbfs"), Path("/Workspace"))
+    )
+    if root == Path("/") or any(
+        root == forbidden or _is_within(root, forbidden)
+        for forbidden in forbidden_roots
+    ):
+        raise ValueError(
+            "--local-staging-root must use ephemeral node-local storage outside "
+            "/Volumes, /dbfs, and /Workspace"
+        )
+    if _is_within(root, destination) or _is_within(destination, root):
+        raise ValueError(
+            "--local-staging-root must be separate from the durable output directory"
+        )
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir():
+        raise NotADirectoryError(f"Local staging root is not a directory: {root}")
+    return root
+
+
+def _serialize_mlflow_artifact_downloads() -> None:
+    """Keep the node-local MLflow download bounded and deterministic."""
+    from mlflow.store.artifact.artifact_repo import ArtifactRepository
+
+    ArtifactRepository.max_workers = property(lambda self: 1)
+
+
+def _file_sizes(root: Path) -> dict[str, int]:
+    sizes: dict[str, int] = {}
+    for path in sorted(root.rglob("*"), key=str):
+        if path.is_symlink():
+            raise ValueError(f"Artifact trees must not contain symlinks: {path}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError(f"Artifact tree contains an unsupported entry: {path}")
+        sizes[path.relative_to(root).as_posix()] = path.stat().st_size
+    return sizes
+
+
+def _copy_file_atomically(source: Path, target: Path) -> None:
+    if target.exists():
+        raise FileExistsError(f"Refusing to overwrite materialized file: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=target.parent,
+        prefix=f".{target.name}.",
+        suffix=".partial",
+        delete=False,
+    ) as handle:
+        partial = Path(handle.name)
+    shutil.copy2(source, partial)
+    expected_size = source.stat().st_size
+    observed_size = partial.stat().st_size
+    if observed_size != expected_size:
+        raise OSError(
+            f"Copied file size mismatch for {source}: "
+            f"expected {expected_size}, got {observed_size}"
+        )
+    partial.replace(target)
+
+
+def _copy_staged_artifact(source: Path, destination: Path) -> tuple[int, int]:
+    expected = _file_sizes(source)
+    if not expected:
+        raise FileNotFoundError(f"Downloaded artifact is empty: {source}")
+
+    for directory in sorted(
+        (path for path in source.rglob("*") if path.is_dir()), key=str
+    ):
+        (destination / directory.relative_to(source)).mkdir(
+            parents=True, exist_ok=True
+        )
+    for relative_path in sorted(expected):
+        _copy_file_atomically(source / relative_path, destination / relative_path)
+
+    observed = _file_sizes(destination)
+    if observed != expected:
+        missing = sorted(set(expected) - set(observed))
+        unexpected = sorted(set(observed) - set(expected))
+        mismatched = sorted(
+            path
+            for path in set(expected) & set(observed)
+            if expected[path] != observed[path]
+        )
+        raise OSError(
+            "Materialized artifact verification failed: "
+            f"missing={missing}, unexpected={unexpected}, size_mismatches={mismatched}"
+        )
+    return len(expected), sum(expected.values())
+
+
 def _status_text(status: Any) -> str | None:
     if status is None:
         return None
@@ -366,6 +465,7 @@ def materialize(
     reuse_existing: bool = False,
     require_volume: bool = False,
     verify_model_version: bool = True,
+    local_staging_root: Path = DEFAULT_LOCAL_STAGING_ROOT,
     mlflow_module: Any | None = None,
 ) -> dict[str, Any]:
     if purpose not in {
@@ -403,6 +503,10 @@ def materialize(
 
     if reuse_existing:
         downloaded_root = destination
+        transfer_strategy = "provided_volume_reuse"
+        staging_root = None
+        staged_file_count = None
+        staged_bytes = None
     else:
         resolved_artifact_uri = artifact_uri or reference.uri
         if resolved_artifact_uri != reference.uri and not re.fullmatch(
@@ -411,18 +515,31 @@ def materialize(
             raise ValueError(
                 "--artifact-uri must be the selected models:/ URI or a runs:/<run_id>/<path> URI"
             )
-        downloaded = mlflow.artifacts.download_artifacts(
-            artifact_uri=resolved_artifact_uri, dst_path=str(destination)
+        staging_root = _validate_local_staging_root(local_staging_root, destination)
+        _serialize_mlflow_artifact_downloads()
+        with tempfile.TemporaryDirectory(
+            prefix="air-uc-model-", dir=staging_root
+        ) as staging_directory:
+            temporary_root = Path(staging_directory).resolve()
+            downloaded = mlflow.artifacts.download_artifacts(
+                artifact_uri=resolved_artifact_uri, dst_path=str(temporary_root)
+            )
+            staged_artifact = Path(downloaded).expanduser().resolve()
+            if not staged_artifact.is_dir():
+                raise FileNotFoundError(
+                    f"MLflow returned a missing artifact directory: {staged_artifact}"
+                )
+            if not _is_within(staged_artifact, temporary_root):
+                raise RuntimeError(
+                    "MLflow downloaded outside AIR node-local staging; refusing the result"
+                )
+            staged_file_count, staged_bytes = _copy_staged_artifact(
+                staged_artifact, destination
+            )
+        downloaded_root = destination
+        transfer_strategy = (
+            "air_node_local_staging_then_sequential_verified_volume_copy"
         )
-        downloaded_root = Path(downloaded).expanduser().resolve()
-        if not downloaded_root.is_dir():
-            raise FileNotFoundError(
-                f"MLflow returned a missing artifact directory: {downloaded_root}"
-            )
-        if not _is_within(downloaded_root, destination):
-            raise RuntimeError(
-                "MLflow downloaded outside the requested destination; refusing the result"
-            )
 
     model_path, inventory = select_model_path(downloaded_root, checkpoint_subpath)
     tokenizer_path = select_tokenizer_path(
@@ -460,6 +577,11 @@ def materialize(
         "destination": str(destination),
         "checkpoint_root": str(downloaded_root),
         "downloaded_artifact_path": str(downloaded_root),
+        "transfer_strategy": transfer_strategy,
+        "local_staging_root": str(staging_root) if staging_root else None,
+        "staged_file_count": staged_file_count,
+        "staged_bytes": staged_bytes,
+        "staged_copy_verified": not reuse_existing,
         "model_path": str(model_path),
         "tokenizer_path": str(tokenizer_path),
         "weight_format": inventory.format,
@@ -502,6 +624,12 @@ def main() -> None:
     parser.add_argument("--tokenizer-subpath")
     parser.add_argument("--reuse-existing", action="store_true")
     parser.add_argument("--require-volume", action="store_true")
+    parser.add_argument(
+        "--local-staging-root",
+        type=Path,
+        default=DEFAULT_LOCAL_STAGING_ROOT,
+        help="Ephemeral AIR node-local directory used before sequential Volume copy",
+    )
     parser.add_argument(
         "--metadata-output",
         type=Path,
@@ -568,6 +696,7 @@ def main() -> None:
         reuse_existing=args.reuse_existing,
         require_volume=args.require_volume,
         verify_model_version=not bool(provided_volume),
+        local_staging_root=args.local_staging_root,
     )
     output = json.dumps(result, indent=2, sort_keys=True)
     if args.metadata_output:

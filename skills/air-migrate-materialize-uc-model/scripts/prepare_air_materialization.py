@@ -13,6 +13,7 @@ from typing import Any
 
 
 DEFAULT_WORKLOAD_DIR = Path("migrate/output/air_materialization")
+DEFAULT_LOCAL_STAGING_ROOT = Path("/tmp")
 MATERIALIZER_NAME = "materialize_uc_model.py"
 SOURCE_CONFIG_NAME = "migration-source.yaml"
 WORKLOAD_NAME = "materialize.yaml"
@@ -180,6 +181,23 @@ def _validate_volume_path(path: Path, label: str) -> Path:
     return resolved
 
 
+def _validate_local_staging_root(path: Path) -> Path:
+    value = str(path).strip()
+    normalized = PurePosixPath(value)
+    if (
+        not value
+        or not normalized.is_absolute()
+        or normalized == PurePosixPath("/")
+        or any(part in {"", ".", ".."} for part in normalized.parts[1:])
+        or normalized.parts[1] in {"Volumes", "dbfs", "Workspace"}
+    ):
+        raise ValueError(
+            "--local-staging-root must use ephemeral node-local storage outside "
+            "/Volumes, /dbfs, and /Workspace"
+        )
+    return Path(str(normalized))
+
+
 def _prepare_workload_dir(path: Path) -> Path:
     destination = path.expanduser().resolve()
     if destination.exists() and not destination.is_dir():
@@ -195,6 +213,7 @@ def _command(
     purpose: str,
     output_dir: Path,
     metadata_output: Path,
+    local_staging_root: Path,
     use_config_source: bool,
     model_uri: str | None,
     artifact_uri: str | None,
@@ -213,6 +232,7 @@ def _command(
         [
             f"--output-dir {shlex.quote(str(output_dir))}",
             f"--metadata-output {shlex.quote(str(metadata_output))}",
+            f"--local-staging-root {shlex.quote(str(local_staging_root))}",
             "--require-volume",
         ]
     )
@@ -238,6 +258,7 @@ def prepare_air_materialization(
     config_path: Path,
     output_dir: Path,
     workload_dir: Path = DEFAULT_WORKLOAD_DIR,
+    local_staging_root: Path = DEFAULT_LOCAL_STAGING_ROOT,
     purpose: str = "continue_training",
     model_uri: str | None = None,
     artifact_uri: str | None = None,
@@ -286,6 +307,7 @@ def prepare_air_materialization(
         )
 
     output_dir = _validate_volume_path(output_dir, "--output-dir")
+    local_staging_root = _validate_local_staging_root(local_staging_root)
     metadata_output = output_dir / "materialization.json"
     workload_dir = _prepare_workload_dir(workload_dir)
 
@@ -310,6 +332,7 @@ def prepare_air_materialization(
             "dependencies": ["mlflow>=3.6,<4", "pyyaml>=6.0"],
         },
         "compute": compute,
+        "env_variables": {"MLFLOW_ENABLE_MULTIPART_DOWNLOAD": "false"},
         "code_source": {
             "type": "snapshot",
             "snapshot": {"root_path": "."},
@@ -320,6 +343,7 @@ def prepare_air_materialization(
                 purpose=purpose,
                 output_dir=output_dir,
                 metadata_output=metadata_output,
+                local_staging_root=local_staging_root,
                 use_config_source=use_config_source,
                 model_uri=selected_model_uri,
                 artifact_uri=artifact_uri,
@@ -357,6 +381,10 @@ def prepare_air_materialization(
         "source_model_uri": selected_model_uri,
         "output_dir": str(output_dir),
         "metadata_output": str(metadata_output),
+        "transfer_strategy": (
+            "air_node_local_staging_then_sequential_verified_volume_copy"
+        ),
+        "local_staging_root": str(local_staging_root),
         "workload_dir": str(workload_dir),
         "workload_file": str(workload_path),
         "files": sorted(files),
@@ -369,6 +397,12 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=Path("migrate/config.yaml"))
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--workload-dir", type=Path, default=DEFAULT_WORKLOAD_DIR)
+    parser.add_argument(
+        "--local-staging-root",
+        type=Path,
+        default=DEFAULT_LOCAL_STAGING_ROOT,
+        help="Ephemeral AIR node-local directory used before sequential Volume copy",
+    )
     parser.add_argument(
         "--purpose",
         choices=("base_model_initialization", "continue_training", "validation"),
@@ -384,6 +418,7 @@ def main() -> None:
         config_path=args.config,
         output_dir=args.output_dir,
         workload_dir=args.workload_dir,
+        local_staging_root=args.local_staging_root,
         purpose=args.purpose,
         model_uri=args.model_uri,
         artifact_uri=args.artifact_uri,

@@ -1,4 +1,4 @@
 interface:
   display_name: "AIR Migrate: Plan Training"
   short_description: "Design an AI Runtime migration plan"
-  default_prompt: "Use $air-migrate-plan-air-training to create an AI Runtime training plan that preserves the configured compute and execution gate."
+  default_prompt: "Use $air-migrate-plan-air-training to apply peft_only, select replicated or sharded LoRA from model-size evidence when required, and preserve configured model-source precedence."

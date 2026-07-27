@@ -33,6 +33,7 @@ IS_DATABRICKS_NOTEBOOK = "dbutils" in globals()
 
 
 def find_project_dir() -> Path:
+    """Locate the generated AIR project directory in local or notebook contexts."""
     candidates = []
     if "__file__" in globals():
         candidates.append(Path(__file__).resolve().parent)
@@ -71,7 +72,7 @@ CONFIG_PATH = PROJECT_DIR / "train.yaml"
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from helper_utils import load_training_config
+from helper_utils import _needs_hf_token, load_training_config
 from training_utils import register_trained_model
 
 
@@ -91,22 +92,14 @@ training_config, _ = load_training_config(CONFIG_PATH)
 
 if IS_DATABRICKS_NOTEBOOK:
     dbutils.widgets.text("mlflow_run_id", "", "MLflow run ID")
-    dbutils.widgets.text("hf_secret_scope", "your-secret-scope", "HF secret scope")
-    dbutils.widgets.text("hf_secret_key", "hf_token", "HF secret key")
     mlflow_run_id = dbutils.widgets.get("mlflow_run_id").strip()
-    hf_secret_scope = dbutils.widgets.get("hf_secret_scope").strip()
-    hf_secret_key = dbutils.widgets.get("hf_secret_key").strip()
 else:
     parser = argparse.ArgumentParser(
         description="Register a trained TRL LoRA checkpoint in Unity Catalog."
     )
     parser.add_argument("--mlflow-run-id", required=True)
-    parser.add_argument("--hf-secret-scope", default="your-secret-scope")
-    parser.add_argument("--hf-secret-key", default="hf_token")
     args = parser.parse_args()
     mlflow_run_id = args.mlflow_run_id.strip()
-    hf_secret_scope = args.hf_secret_scope.strip()
-    hf_secret_key = args.hf_secret_key.strip()
 
 if not mlflow_run_id:
     raise ValueError(
@@ -133,8 +126,8 @@ print(f"UC model target: {training_config['registered_model_name']}")
 # MAGIC If `merged_output_dir` already contains a portable full checkpoint it
 # MAGIC is reused. Otherwise the notebook launches the same GPU merge used by
 # MAGIC `01_runner`. Volume-backed base weights are staged into the node-local
-# MAGIC cache configured in `train.yaml` before the merge loads them. Remote
-# MAGIC Hugging Face sources require a token.
+# MAGIC cache configured in `train.yaml` before the merge loads them. A gated
+# MAGIC Hugging Face base model uses the configured `HF_TOKEN` secret.
 
 # COMMAND ----------
 
@@ -155,40 +148,34 @@ merged_checkpoint_ready = (
 if merged_checkpoint_ready:
     print(f"Reusing merged checkpoint: {merged_output_dir}")
 else:
-    HF_TOKEN = os.environ.get("HF_TOKEN")
-    model_references = [training_config["model_name"]]
-    if training_config.get("tokenizer_path"):
-        model_references.append(training_config["tokenizer_path"])
-    requires_hf_token = any(
-        not Path(str(reference)).expanduser().is_absolute()
-        for reference in model_references
-    )
-    if requires_hf_token and not HF_TOKEN:
-        if not IS_DATABRICKS_NOTEBOOK:
-            raise ValueError(
-                "Set HF_TOKEN in the AIR environment before materializing a "
-                "merged checkpoint from a remote Hugging Face model."
-            )
-        if (
-            not hf_secret_scope
-            or hf_secret_scope == "your-secret-scope"
-            or not hf_secret_key
-        ):
-            raise ValueError(
-                "Set hf_secret_scope/hf_secret_key to a Databricks secret "
-                "containing a Hugging Face token, or provide HF_TOKEN."
-            )
-        HF_TOKEN = dbutils.secrets.get(
-            scope=hf_secret_scope,
-            key=hf_secret_key,
-        )
-
     import yaml
     from serverless_gpu.compute import GPUType
     from serverless_gpu.launcher import distributed
 
     with CONFIG_PATH.open("r", encoding="utf-8") as handle:
         workload = yaml.safe_load(handle)
+
+    HF_TOKEN = os.environ.get("HF_TOKEN")
+    if _needs_hf_token(training_config) and not HF_TOKEN:
+        if not IS_DATABRICKS_NOTEBOOK:
+            raise ValueError(
+                "A gated Hugging Face source requires HF_TOKEN in the AIR environment"
+            )
+        secret_reference = str(
+            (workload.get("secrets") or {}).get("HF_TOKEN", "")
+        )
+        if "/" not in secret_reference:
+            raise ValueError(
+                "A gated Hugging Face source requires secrets.HF_TOKEN as "
+                "<scope>/<key>"
+            )
+        default_scope, default_key = secret_reference.split("/", 1)
+        dbutils.widgets.text("hf_secret_scope", default_scope, "HF secret scope")
+        dbutils.widgets.text("hf_secret_key", default_key, "HF secret key")
+        HF_TOKEN = dbutils.secrets.get(
+            scope=dbutils.widgets.get("hf_secret_scope").strip(),
+            key=dbutils.widgets.get("hf_secret_key").strip(),
+        )
 
     supported_air_accelerators = {
         "GPU_1xA10": (1, "A10"),
@@ -219,6 +206,7 @@ else:
 
     @distributed(gpus=num_gpus, gpu_type=gpu_type)
     def run_merge_job(config_path: str, hf_token: str | None):
+        """Merge plain-LoRA adapter weights on one AIR distributed worker."""
         import os
         import sys
         from pathlib import Path
@@ -228,7 +216,6 @@ else:
             sys.path.insert(0, str(project_dir))
         if hf_token:
             os.environ["HF_TOKEN"] = hf_token
-
         from training_utils import merge_peft_model
 
         return merge_peft_model(config_path=config_path)

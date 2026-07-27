@@ -1,4 +1,4 @@
 interface:
-  display_name: "AIR Migrate: Resolve UC Weights"
-  short_description: "Reuse Volume weights or stage them through AIR"
-  default_prompt: "Use $air-migrate-materialize-uc-model to resolve input weights through a configured Volume or AIR while preserving the migration execution gate."
+  display_name: "AIR Migrate: Retired Materializer"
+  short_description: "Historical materialization compatibility only"
+  default_prompt: "This skill is retired; generated workloads handle configured Volume, system.ai, or Hugging Face inputs only at operator runtime."

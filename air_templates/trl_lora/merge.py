@@ -10,6 +10,7 @@ from training_utils import merge_peft_model
 
 
 def main() -> None:
+    """Merge adapter weights from the command line and print rank-zero output."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",

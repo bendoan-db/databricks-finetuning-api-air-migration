@@ -1,38 +1,29 @@
 # Portable checkpoint contract
 
-A checkpoint is eligible for direct AI Runtime continued training only when all conditions below hold.
+Apply this structural contract to a configured `source.weights_volume_path` during read-only inspection and to a downloaded system.ai artifact at operator runtime. Do not load tensors merely to validate structure.
 
-When `source.existing_weights_volume_location` is populated, the configured directory itself must satisfy this contract for both model and tokenizer. Validate it structurally without copying or loading tensors. Do not search another location or fall back to downloading the configured UC version.
+## Required model files
 
-## Model files
+- A valid `config.json` identifying a model type or architecture.
+- Full weights in `model*.safetensors` or `pytorch_model*.bin` files.
+- Every shard named by a safetensors or PyTorch index file.
+- No reliance on adapter-only files such as `adapter_model.safetensors`.
 
-- `config.json` is valid JSON and identifies a model type or architecture.
-- Full model weights exist as one of:
-  - `model.safetensors`
-  - `model-*.safetensors`, normally with `model.safetensors.index.json`
-  - `pytorch_model.bin`
-  - `pytorch_model-*.bin`, normally with `pytorch_model.bin.index.json`
-- Every filename referenced by a sharded index exists beneath the same checkpoint directory.
-- Adapter files such as `adapter_model.safetensors` do not count as full weights.
+## Required tokenizer files
 
-## Tokenizer files
+- `tokenizer_config.json`.
+- At least one tokenizer asset: `tokenizer.json`, `tokenizer.model`, `spiece.model`, `sentencepiece.bpe.model`, `vocab.json`, or `vocab.txt`.
 
-- `tokenizer_config.json` exists.
-- At least one self-contained tokenizer asset exists, such as `tokenizer.json`, `tokenizer.model`, `spiece.model`, `vocab.json`, or `vocab.txt`.
-- The tokenizer directory may differ from the model directory; the AIR configuration must then set `tokenizer_path` explicitly.
+The current generated configurations use the same reference for model and tokenizer. Add explicit template support before accepting split directories or distinct repositories.
+
+## Runtime staging
+
+For Volume input, inventory files and sizes before copying. Require free node-local capacity for the complete checkpoint plus the greater of 1 GiB or 10 percent reserve. Copy under a per-source lock, verify copied file sizes, and publish only an atomically completed cache directory.
+
+For system.ai input, download through MLflow into a partial node-local directory, require exactly one checkpoint satisfying this contract, write a completion marker, and atomically publish it to the cache. Preserve the exact versioned system.ai URI in the marker.
+
+The cache is disposable. Durable adapters, checkpoints, merged weights, and registration inputs must remain on Unity Catalog Volumes.
 
 ## Unsupported artifacts
 
-Stop and require an explicit conversion or template extension for:
-
-- MLflow serving packages without portable Hugging Face weights
-- PEFT adapters without a resolved base model and explicit merge/adapter-loading plan
-- Optimizer-only or FSDP-only shards that cannot be consolidated as a Hugging Face checkpoint
-- Multiple plausible checkpoints or tokenizers whose provenance cannot be distinguished
-- Architectures incompatible with the selected AIR template
-
-The AIR materialization step validates structure and provenance without loading tensor contents. Record its successful AIR run ID and persisted inventory. Perform a clean `AutoConfig`, tokenizer, and model smoke load later during migration validation on compute sized for the checkpoint.
-
-Use the persisted inventory to estimate downstream node-local staging capacity. Every AIR node needs room for each distinct Volume-backed model/tokenizer directory plus at least 1 GiB or 10 percent reserve. This runtime cache is disposable; the portable checkpoint and inventory remain on the UC Volume.
-
-Prefer the registered `models:/catalog.schema.model/version` artifact. Use a `runs:/run_id/path` fallback only when the inspection manifest records that exact portable artifact as lineage of the selected UC model version.
+Stop or require a new template for serving-only MLflow packages, adapter-only sources without an explicit base model, optimizer/FSDP shards that cannot form a portable Transformers checkpoint, multiple plausible checkpoints, missing tokenizers, or incompatible architectures.

@@ -38,10 +38,8 @@ def run_training(
         os.environ["HF_TOKEN"] = hf_token
     if _needs_hf_token(config) and not os.environ.get("HF_TOKEN"):
         raise RuntimeError(
-            "HF_TOKEN is required for the configured remote model or tokenizer. "
-            "Configure train.yaml secrets for AIR CLI runs or notebook widgets."
+            "HF_TOKEN is required for the configured gated Hugging Face model"
         )
-
     os.environ.setdefault("HF_MLFLOW_LOG_ARTIFACTS", "false")
     os.environ.setdefault("MLFLOW_FLATTEN_PARAMS", "true")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -118,9 +116,9 @@ def run_training(
             }
         )
         print(f"Configuration: {resolved_path}")
-        print(f"Model: {config['model_name']}")
         print(f"Model load reference: {model_reference}")
         print(f"Model source: {config['model_source']}")
+        print(f"Configured model: {config['model_name']}")
         print(f"Source model URI: {config.get('source_model_uri')}")
         print(f"Training data: {config['train_data_path']}")
         print(f"Evaluation data: {config['eval_data_path']}")
@@ -171,6 +169,7 @@ def run_training(
         "mlflow_run_id": run_id if rank == 0 else None,
         "output_dir": config["output_dir"] if rank == 0 else None,
         "model_source": config["model_source"] if rank == 0 else None,
+        "model_path": config["model_name"] if rank == 0 else None,
         "source_model_uri": config.get("source_model_uri") if rank == 0 else None,
         "migration_experiment_path": config["experiment_path"] if rank == 0 else None,
         "model_staging": staging["model"] if rank == 0 else None,
@@ -178,6 +177,7 @@ def run_training(
 
 
 def main() -> None:
+    """Run training from the command line and print the rank-zero result."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",

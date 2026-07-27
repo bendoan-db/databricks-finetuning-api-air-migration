@@ -1,8 +1,7 @@
 # Llama 3.1 8B Instruct supervised fine-tuning with TRL and plain LoRA on
 # Databricks AI Runtime.
 #
-# Before running, update the Unity Catalog paths and, for remote gated models,
-# the HF_TOKEN secret below.
+# Before running, select a Volume, system.ai, or Hugging Face model source.
 # From this directory, submit with:
 #   air run --file train.yaml --watch
 
@@ -35,7 +34,8 @@ env_variables:
   TOKENIZERS_PARALLELISM: 'false'
   TORCH_NCCL_ASYNC_ERROR_HANDLING: '1'
 
-# AI Runtime injects this Databricks secret into the workload as HF_TOKEN.
+# Retain this secret for gated Hugging Face sources. Generation removes it for
+# Volume and system.ai inputs, and may remove it for public HF repositories.
 secrets:
   HF_TOKEN: doan/hf_token
 
@@ -48,17 +48,16 @@ command: torchrun --nproc_per_node=8 $CODE_SOURCE_PATH/train.py
 
 parameters:
   training_config:
-    # Generated migrations set this from migrate/config.yaml. When true,
-    # model_name/tokenizer_path must be the materialized configured UC version.
-    use_existing_weights: false
-    model_source: hugging_face  # existing_uc | system_ai | hugging_face
-    source_model_uri:
+    # source_model_uri records the legacy model lineage. model_name and
+    # tokenizer_path identify the selected training input.
+    model_source: hugging_face  # volume | system_ai | hugging_face
+    requires_hf_token: true
+    source_model_uri: models:/doan.ft_api_migration.tabformer_fraud_classifier/2
     model_name: meta-llama/Meta-Llama-3.1-8B-Instruct
-    # existing_uc/system_ai sources set these to worker-readable Volume paths.
-    tokenizer_path:
-    # Volume-backed model/tokenizer directories are copied once per AIR node to
-    # ephemeral local storage before Transformers loads them. Outputs remain in
-    # Unity Catalog Volumes. Use a node-local path with enough free capacity.
+    tokenizer_path: meta-llama/Meta-Llama-3.1-8B-Instruct
+    # Volume inputs are copied and system.ai artifacts are downloaded once per
+    # AIR node into this ephemeral cache. Hugging Face uses its own download
+    # cache. Outputs remain in Unity Catalog Volumes.
     local_model_cache_dir: /tmp/air-model-cache
     local_model_cache_copy_workers: 8
     experiment_path: /Shared/llama31_8b_instruct_trl_lora

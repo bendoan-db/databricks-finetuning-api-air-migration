@@ -23,6 +23,7 @@ from pathlib import Path
 
 
 def find_project_dir() -> Path:
+    """Locate the generated AIR project directory in local or notebook contexts."""
     candidates = []
     if "__file__" in globals():
         candidates.append(Path(__file__).resolve().parent)

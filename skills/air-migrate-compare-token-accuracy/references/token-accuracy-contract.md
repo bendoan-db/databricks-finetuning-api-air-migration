@@ -1,4 +1,6 @@
-# Token-accuracy metric and evidence contract
+# Token-accuracy metric and evidence contract (historical)
+
+This contract is retained for downstream operators and older branches. The current migration skills do not run it, include it in the generated handoff, or use it to claim migration completion.
 
 ## Metric semantics
 

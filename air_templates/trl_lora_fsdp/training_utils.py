@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from helper_utils import (
-    VOLUME_PREFIX,
     _is_local_model_reference,
     _needs_hf_token,
     _validate_registered_model_name,
@@ -40,6 +39,7 @@ def distributed_context() -> tuple[int, int, int]:
 
 
 def _directory_inventory(source: Path) -> list[tuple[Path, Path, int]]:
+    """List model files with paths relative to the source and byte sizes."""
     inventory: list[tuple[Path, Path, int]] = []
     for current_root, directory_names, file_names in os.walk(source):
         directory_names.sort()
@@ -54,7 +54,10 @@ def _directory_inventory(source: Path) -> list[tuple[Path, Path, int]]:
     return inventory
 
 
-def _read_local_cache_marker(marker_path: Path, source: Path) -> dict[str, Any]:
+def _read_local_cache_marker(
+    marker_path: Path, source_reference: str
+) -> dict[str, Any]:
+    """Load and validate a completed node-local model cache marker."""
     try:
         with marker_path.open("r", encoding="utf-8") as handle:
             marker = json.load(handle)
@@ -66,10 +69,10 @@ def _read_local_cache_marker(marker_path: Path, source: Path) -> dict[str, Any]:
         raise RuntimeError(f"Invalid local model cache marker: {marker_path}")
     if marker.get("schema_version") != LOCAL_CACHE_SCHEMA_VERSION:
         raise RuntimeError(f"Unsupported local model cache marker: {marker_path}")
-    if marker.get("source_path") != str(source):
+    if marker.get("source_path") != source_reference:
         raise RuntimeError(
             f"Local model cache source mismatch in {marker_path}: "
-            f"{marker.get('source_path')!r} != {str(source)!r}"
+            f"{marker.get('source_path')!r} != {source_reference!r}"
         )
     return marker
 
@@ -79,6 +82,7 @@ def _stage_directory_to_local_cache(
     cache_root_reference: str,
     copy_workers: int,
 ) -> tuple[str, dict[str, Any]]:
+    """Copy a model directory into a process-safe node-local cache."""
     source = Path(source_reference).expanduser()
     cache_root = Path(cache_root_reference).expanduser()
     cache_root.mkdir(parents=True, exist_ok=True)
@@ -96,7 +100,7 @@ def _stage_directory_to_local_cache(
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         lock_wait_seconds = time.monotonic() - operation_started
         if marker_path.is_file():
-            marker = _read_local_cache_marker(marker_path, source)
+            marker = _read_local_cache_marker(marker_path, str(source))
         else:
             if destination.exists():
                 raise RuntimeError(
@@ -122,6 +126,7 @@ def _stage_directory_to_local_cache(
             partial.mkdir(parents=False)
 
             def copy_file(item: tuple[Path, Path, int]) -> None:
+                """Copy one inventoried file and verify its resulting size."""
                 source_file, relative_path, expected_size = item
                 destination_file = partial / relative_path
                 destination_file.parent.mkdir(parents=True, exist_ok=True)
@@ -172,23 +177,168 @@ def _stage_directory_to_local_cache(
     }
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    """Return whether a path is contained within the given root."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _select_portable_checkpoint(downloaded_root: Path) -> Path:
+    """Find the sole portable model-and-tokenizer checkpoint in an artifact."""
+    candidates: list[Path] = []
+    tokenizer_names = {
+        "tokenizer.json",
+        "tokenizer.model",
+        "spiece.model",
+        "sentencepiece.bpe.model",
+        "vocab.json",
+        "vocab.txt",
+    }
+    for config_path in sorted(downloaded_root.rglob("config.json"), key=str):
+        candidate = config_path.parent
+        has_weights = any(
+            path.is_file()
+            for pattern in ("model*.safetensors", "pytorch_model*.bin")
+            for path in candidate.glob(pattern)
+        )
+        has_tokenizer = (candidate / "tokenizer_config.json").is_file() and any(
+            (candidate / name).is_file() for name in tokenizer_names
+        )
+        if has_weights and has_tokenizer:
+            candidates.append(candidate)
+    if not candidates:
+        raise FileNotFoundError(
+            "The system.ai artifact does not contain a portable full model and "
+            "tokenizer checkpoint"
+        )
+    if len(candidates) != 1:
+        raise ValueError(
+            "The system.ai artifact contains multiple portable checkpoints: "
+            + ", ".join(str(path) for path in candidates)
+        )
+    return candidates[0]
+
+
+def _stage_system_ai_model(
+    model_uri: str,
+    cache_root_reference: str,
+) -> tuple[str, dict[str, Any]]:
+    """Download a system.ai model artifact into a node-local cache."""
+    cache_root = Path(cache_root_reference).expanduser()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_key = hashlib.sha256(
+        f"{LOCAL_CACHE_SCHEMA_VERSION}\0system_ai\0{model_uri}".encode("utf-8")
+    ).hexdigest()[:24]
+    destination = cache_root / cache_key
+    marker_path = destination / ".air-local-cache.json"
+    lock_path = cache_root / f".{cache_key}.lock"
+    operation_started = time.monotonic()
+    downloaded_by_process = False
+
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        lock_wait_seconds = time.monotonic() - operation_started
+        if marker_path.is_file():
+            marker = _read_local_cache_marker(marker_path, model_uri)
+        else:
+            if destination.exists():
+                raise RuntimeError(
+                    "Local system.ai cache exists without a completion marker: "
+                    f"{destination}"
+                )
+            partial = cache_root / f".{cache_key}.partial-{os.getpid()}"
+            if partial.exists():
+                raise RuntimeError(f"Stale system.ai download path: {partial}")
+            partial.mkdir(parents=False)
+            download_started = time.monotonic()
+            try:
+                import mlflow
+
+                mlflow.set_registry_uri("databricks-uc")
+                downloaded = mlflow.artifacts.download_artifacts(
+                    artifact_uri=model_uri,
+                    dst_path=str(partial),
+                )
+                downloaded_root = Path(downloaded).expanduser().resolve()
+                if not downloaded_root.is_dir() or not _is_within(
+                    downloaded_root, partial.resolve()
+                ):
+                    raise RuntimeError(
+                        "MLflow downloaded the system.ai artifact outside the "
+                        "node-local staging directory"
+                    )
+                checkpoint = _select_portable_checkpoint(downloaded_root)
+                inventory = _directory_inventory(checkpoint)
+                total_bytes = sum(size for _, _, size in inventory)
+                reserve_bytes = max(1 << 30, total_bytes // 10)
+                if shutil.disk_usage(cache_root).free < reserve_bytes:
+                    raise OSError(
+                        f"Insufficient reserve under {cache_root} after system.ai "
+                        f"download; need {reserve_bytes:,} free bytes"
+                    )
+                marker = {
+                    "schema_version": LOCAL_CACHE_SCHEMA_VERSION,
+                    "source_path": model_uri,
+                    "acquisition": "system_ai_download",
+                    "file_count": len(inventory),
+                    "total_bytes": total_bytes,
+                    "copy_workers": 0,
+                    "copy_duration_seconds": time.monotonic() - download_started,
+                }
+                with (checkpoint / marker_path.name).open(
+                    "w", encoding="utf-8"
+                ) as handle:
+                    json.dump(marker, handle, indent=2, sort_keys=True)
+                os.replace(checkpoint, destination)
+                downloaded_by_process = True
+            finally:
+                if partial.exists():
+                    shutil.rmtree(partial, ignore_errors=True)
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    duration_seconds = float(marker["copy_duration_seconds"])
+    total_bytes = int(marker["total_bytes"])
+    return str(destination), {
+        **marker,
+        "destination": str(destination),
+        "staged": True,
+        "cache_hit": not downloaded_by_process,
+        "lock_wait_seconds": lock_wait_seconds,
+        "throughput_mib_per_second": (
+            total_bytes / max(duration_seconds, 1.0e-9) / (1024 * 1024)
+        ),
+    }
+
+
 def _stage_model_references(
     config: dict[str, Any],
 ) -> tuple[str, str, dict[str, Any]]:
+    """Resolve model and tokenizer references for the configured source type."""
+    source_kind = str(config["model_source"])
     model_source = str(config["model_name"])
     tokenizer_source = str(config.get("tokenizer_path") or model_source)
+    cache_root = str(config["local_model_cache_dir"])
 
-    if model_source.startswith(VOLUME_PREFIX):
+    if source_kind == "volume":
         model_reference, model_staging = _stage_directory_to_local_cache(
             model_source,
-            str(config["local_model_cache_dir"]),
+            cache_root,
             int(config["local_model_cache_copy_workers"]),
+        )
+    elif source_kind == "system_ai":
+        model_reference, model_staging = _stage_system_ai_model(
+            model_source,
+            cache_root,
         )
     else:
         model_reference = model_source
         model_staging = {
             "source_path": model_source,
             "destination": model_source,
+            "acquisition": "hugging_face_download",
             "staged": False,
             "cache_hit": False,
         }
@@ -202,10 +352,10 @@ def _stage_model_references(
     if tokenizer_reuses_model_cache:
         tokenizer_reference = model_reference
         tokenizer_staging = model_staging
-    elif tokenizer_source.startswith(VOLUME_PREFIX):
+    elif source_kind == "volume":
         tokenizer_reference, tokenizer_staging = _stage_directory_to_local_cache(
             tokenizer_source,
-            str(config["local_model_cache_dir"]),
+            cache_root,
             int(config["local_model_cache_copy_workers"]),
         )
     else:
@@ -213,6 +363,7 @@ def _stage_model_references(
         tokenizer_staging = {
             "source_path": tokenizer_source,
             "destination": tokenizer_source,
+            "acquisition": "hugging_face_download",
             "staged": False,
             "cache_hit": False,
         }
@@ -229,6 +380,7 @@ def _stage_model_references(
 
 
 def _log_local_model_staging(staging: dict[str, Any]) -> None:
+    """Log model and tokenizer staging metadata to the active MLflow run."""
     import mlflow
 
     model_staging = staging["model"]
@@ -281,6 +433,7 @@ def _log_local_model_staging(staging: dict[str, Any]) -> None:
 
 
 def _validate_runtime_inputs(config: dict[str, Any]) -> None:
+    """Validate local inputs and prepare an empty or resumable output path."""
     for key in ("model_name", "tokenizer_path"):
         reference = config.get(key)
         if reference and _is_local_model_reference(str(reference)):
@@ -317,6 +470,7 @@ def _prepare_sft_dataset(dataset: Any, name: str, dataset_num_proc: int) -> Any:
     def expand_batch(
         batch: dict[str, list[Any]], indices: list[int]
     ) -> dict[str, list[Any]]:
+        """Expand batched conversations into prompt-completion pairs."""
         prompts: list[list[dict[str, str]]] = []
         completions: list[list[dict[str, str]]] = []
         for row_index, messages in zip(indices, batch["messages"]):
@@ -369,6 +523,7 @@ def _prepare_sft_dataset(dataset: Any, name: str, dataset_num_proc: int) -> Any:
 
 
 def _build_lora_config(config: dict[str, Any]) -> Any:
+    """Build the PEFT LoRA configuration from normalized training settings."""
     from peft import LoraConfig
 
     return LoraConfig(
@@ -382,6 +537,7 @@ def _build_lora_config(config: dict[str, Any]) -> Any:
 
 
 def _load_tokenizer(config: dict[str, Any], tokenizer_reference: str) -> Any:
+    """Load and configure the tokenizer used by LoRA FSDP training."""
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -404,6 +560,7 @@ def _load_tokenizer(config: dict[str, Any], tokenizer_reference: str) -> Any:
 
 
 def _build_sft_config(config: dict[str, Any], model_reference: str) -> Any:
+    """Build TRL supervised fine-tuning arguments for LoRA with FSDP."""
     from trl import SFTConfig
 
     fsdp_config = dict(config["fsdp_config"])
@@ -462,6 +619,7 @@ def _build_sft_config(config: dict[str, Any], model_reference: str) -> Any:
 
 
 def _start_or_reuse_mlflow_run(config: dict[str, Any]) -> tuple[Any, bool]:
+    """Start or reuse a training run in the configured MLflow experiment."""
     import mlflow
 
     experiment = mlflow.set_experiment(config["experiment_path"])
@@ -488,6 +646,7 @@ def _start_or_reuse_mlflow_run(config: dict[str, Any]) -> tuple[Any, bool]:
 def _log_training_contract(
     config: dict[str, Any], world_size: int, train_rows: int, eval_rows: int
 ) -> None:
+    """Record the effective LoRA FSDP training contract in MLflow."""
     import mlflow
 
     mlflow.set_tags(
@@ -495,8 +654,7 @@ def _log_training_contract(
             "training_framework": "trl_sft_peft_fsdp",
             "training_scope": "lora_adapter",
             "model_source": config["model_source"],
-            "source_model_uri": config.get("source_model_uri") or "",
-            "use_existing_weights": str(config["use_existing_weights"]).lower(),
+            "source_model_uri": config["source_model_uri"],
         }
     )
     mlflow.log_params(
@@ -542,9 +700,8 @@ def merge_peft_model(
     config, _ = load_training_config(config_path)
     if _needs_hf_token(config) and not os.environ.get("HF_TOKEN"):
         raise RuntimeError(
-            "HF_TOKEN is required to reload the configured base model or tokenizer"
+            "HF_TOKEN is required to reload the configured Hugging Face base model"
         )
-
     adapter_dir = Path(config["output_dir"]).resolve()
     adapter_config = adapter_dir / "adapter_config.json"
     adapter_weights = next(
@@ -685,8 +842,7 @@ def register_trained_model(
                 "training_framework": "trl_sft_peft_fsdp",
                 "base_model": config["model_name"],
                 "base_model_source": config["model_source"],
-                "base_model_uri": config.get("source_model_uri"),
-                "use_existing_weights": config["use_existing_weights"],
+                "base_model_uri": config["source_model_uri"],
                 "adapter_output_dir": config["output_dir"],
                 "training_run_id": run_id,
             },
@@ -700,5 +856,6 @@ def register_trained_model(
         "name": str(registered.name),
         "version": str(registered.version),
         "model_uri": f"models:/{registered.name}/{registered.version}",
-        "source_model_uri": str(model_info.model_uri),
+        "logged_model_uri": str(model_info.model_uri),
+        "source_model_uri": config["source_model_uri"],
     }

@@ -1,4 +1,4 @@
 interface:
   display_name: "AIR Migrate: Orchestrate FMT Model"
-  short_description: "Orchestrate an FMT-to-AIR migration"
-  default_prompt: "Use $air-migrate-migrate-fmt-model to migrate the configured model while enforcing its preparation-only or full-migration execution gate."
+  short_description: "Generate an FMT-to-AIR workload handoff"
+  default_prompt: "Use $air-migrate-migrate-fmt-model to apply peft_only, generate the configured AIR workload, and stop before training, registration, or evaluation."

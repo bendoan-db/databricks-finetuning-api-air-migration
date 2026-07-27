@@ -18,6 +18,7 @@ SUPPORTED_STRATEGIES = {"no", "steps", "epoch"}
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:
+    """Read and return a YAML mapping from ``path``."""
     if not path.is_file():
         raise FileNotFoundError(f"Configuration file does not exist: {path}")
     with path.open("r", encoding="utf-8") as handle:
@@ -28,6 +29,7 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 
 def _resolve_config_path(config_path: str | Path | None = None) -> Path:
+    """Resolve the training configuration path for CLI and AIR execution."""
     if config_path is not None:
         return Path(config_path).expanduser().resolve()
 
@@ -45,6 +47,7 @@ def _resolve_config_path(config_path: str | Path | None = None) -> Path:
 
 
 def _required_string(config: dict[str, Any], key: str) -> str:
+    """Return a required nonblank string from the training configuration."""
     value = str(config.get(key, "")).strip()
     if not value:
         raise ValueError(f"training_config.{key} must be a non-empty string")
@@ -52,6 +55,7 @@ def _required_string(config: dict[str, Any], key: str) -> str:
 
 
 def _required_bool(config: dict[str, Any], key: str) -> bool:
+    """Return a required Boolean from the training configuration."""
     value = config.get(key)
     if not isinstance(value, bool):
         raise ValueError(f"training_config.{key} must be true or false")
@@ -59,6 +63,7 @@ def _required_bool(config: dict[str, Any], key: str) -> bool:
 
 
 def _positive_int(config: dict[str, Any], key: str) -> int:
+    """Parse and return a strictly positive integer configuration value."""
     value = config.get(key)
     if isinstance(value, bool):
         raise ValueError(f"training_config.{key} must be a positive integer")
@@ -72,6 +77,7 @@ def _positive_int(config: dict[str, Any], key: str) -> int:
 
 
 def _nonnegative_int(config: dict[str, Any], key: str) -> int:
+    """Parse and return a nonnegative integer configuration value."""
     value = config.get(key)
     if isinstance(value, bool):
         raise ValueError(f"training_config.{key} must be a nonnegative integer")
@@ -87,6 +93,7 @@ def _nonnegative_int(config: dict[str, Any], key: str) -> int:
 
 
 def _positive_float(config: dict[str, Any], key: str) -> float:
+    """Parse and return a strictly positive floating-point value."""
     try:
         value = float(config.get(key))
     except (TypeError, ValueError) as error:
@@ -97,6 +104,7 @@ def _positive_float(config: dict[str, Any], key: str) -> float:
 
 
 def _nonnegative_float(config: dict[str, Any], key: str) -> float:
+    """Parse and return a nonnegative floating-point value."""
     try:
         value = float(config.get(key))
     except (TypeError, ValueError) as error:
@@ -109,6 +117,7 @@ def _nonnegative_float(config: dict[str, Any], key: str) -> float:
 
 
 def _validate_registered_model_name(config: dict[str, Any]) -> str:
+    """Validate and return a three-level Unity Catalog model name."""
     name = _required_string(config, "registered_model_name")
     parts = name.split(".")
     if len(parts) != 3 or any(not part.strip() for part in parts):
@@ -119,6 +128,7 @@ def _validate_registered_model_name(config: dict[str, Any]) -> str:
 
 
 def _validate_experiment_path(config: dict[str, Any]) -> str:
+    """Validate and normalize the absolute MLflow workspace experiment path."""
     value = _required_string(config, "experiment_path")
     path = PurePosixPath(value)
     if (
@@ -137,79 +147,97 @@ def _validate_experiment_path(config: dict[str, Any]) -> str:
 
 
 def _is_local_model_reference(value: str) -> bool:
+    """Return whether a model reference is an absolute local filesystem path."""
     return Path(value).expanduser().is_absolute()
 
 
 def _needs_hf_token(config: dict[str, Any]) -> bool:
-    references = [str(config["model_name"])]
-    if config.get("tokenizer_path"):
-        references.append(str(config["tokenizer_path"]))
-    return any(not _is_local_model_reference(value) for value in references)
+    """Return whether the selected Hugging Face source requires a token."""
+    return (
+        config.get("model_source") == "hugging_face"
+        and config.get("requires_hf_token") is True
+    )
 
 
 def _validate_model_source(config: dict[str, Any]) -> None:
-    use_existing_weights = config.get("use_existing_weights")
-    if not isinstance(use_existing_weights, bool):
-        raise ValueError("training_config.use_existing_weights must be true or false")
+    """Validate lineage and model references for the selected source mode."""
+    source_model_uri = _required_string(config, "source_model_uri")
+    match = MODEL_URI_PATTERN.fullmatch(source_model_uri)
+    source_parts = match.group(1).split(".") if match is not None else []
+    if len(source_parts) != 3 or not all(source_parts):
+        raise ValueError(
+            "training_config.source_model_uri must use "
+            "models:/<catalog>.<schema>.<model>/<version>"
+        )
+    config["source_model_uri"] = source_model_uri
 
     model_source = _required_string(config, "model_source")
-    if model_source not in {"existing_uc", "system_ai", "hugging_face"}:
+    if model_source not in {"volume", "system_ai", "hugging_face"}:
         raise ValueError(
-            "training_config.model_source must be existing_uc, system_ai, or "
+            "training_config.model_source must be volume, system_ai, or "
             "hugging_face"
         )
+    model_name = _required_string(config, "model_name")
+    tokenizer_path = _required_string(config, "tokenizer_path")
+    requires_hf_token = _required_bool(config, "requires_hf_token")
+    if model_source != "hugging_face" and requires_hf_token:
+        raise ValueError(
+            "training_config.requires_hf_token may be true only for hugging_face"
+        )
 
-    source_model_uri = config.get("source_model_uri")
-    model_uri_match = None
-    if source_model_uri is not None:
-        source_model_uri = str(source_model_uri).strip()
-        model_uri_match = MODEL_URI_PATTERN.fullmatch(source_model_uri)
-        if model_uri_match is None or len(model_uri_match.group(1).split(".")) != 3:
-            raise ValueError(
-                "training_config.source_model_uri must be null or use "
-                "models:/<catalog>.<schema>.<model>/<version>"
-            )
-        config["source_model_uri"] = source_model_uri
-
-    references = [str(config["model_name"])]
-    if config.get("tokenizer_path"):
-        references.append(str(config["tokenizer_path"]))
-    volume_references = all(value.startswith(VOLUME_PREFIX) for value in references)
-
-    if use_existing_weights:
-        if model_source != "existing_uc" or model_uri_match is None:
-            raise ValueError(
-                "use_existing_weights=true requires model_source=existing_uc and "
-                "a versioned source_model_uri"
-            )
-        if not volume_references:
-            raise ValueError(
-                "Existing UC weights and tokenizer must be available under /Volumes"
-            )
-    elif model_source == "existing_uc":
-        raise ValueError("model_source=existing_uc requires use_existing_weights=true")
+    if model_source == "volume":
+        for key, value in (
+            ("model_name", model_name),
+            ("tokenizer_path", tokenizer_path),
+        ):
+            path = PurePosixPath(value)
+            if (
+                not path.is_absolute()
+                or len(path.parts) < 5
+                or path.parts[1] != "Volumes"
+                or any(part in {"", ".", ".."} for part in path.parts[2:])
+            ):
+                raise ValueError(
+                    f"training_config.{key} must use "
+                    "/Volumes/<catalog>/<schema>/<volume>[/<checkpoint-path>]"
+                )
+            config[key] = str(path)
     elif model_source == "system_ai":
-        if model_uri_match is None or not model_uri_match.group(1).startswith(
-            "system.ai."
+        system_match = MODEL_URI_PATTERN.fullmatch(model_name)
+        system_parts = (
+            system_match.group(1).split(".") if system_match is not None else []
+        )
+        if (
+            len(system_parts) != 3
+            or system_parts[:2] != ["system", "ai"]
+            or not all(system_parts)
         ):
             raise ValueError(
-                "model_source=system_ai requires a versioned "
-                "models:/system.ai.<model> URI"
+                "model_source=system_ai requires model_name to use "
+                "models:/system.ai.<model>/<version>"
             )
-        if not volume_references:
+        if tokenizer_path != model_name:
             raise ValueError(
-                "system.ai weights and tokenizer must be available under /Volumes"
+                "model_source=system_ai requires tokenizer_path to equal model_name"
             )
     else:
-        if source_model_uri is not None:
-            raise ValueError("model_source=hugging_face requires source_model_uri=null")
-        if any(_is_local_model_reference(value) for value in references):
-            raise ValueError(
-                "model_source=hugging_face requires remote Hugging Face references"
-            )
+        for key, value in (
+            ("model_name", model_name),
+            ("tokenizer_path", tokenizer_path),
+        ):
+            if _is_local_model_reference(value) or value.startswith("models:/"):
+                raise ValueError(
+                    f"model_source=hugging_face requires {key} to be a remote "
+                    "Hugging Face repository ID"
+                )
+            if any(character.isspace() for character in value):
+                raise ValueError(
+                    f"training_config.{key} must not contain whitespace"
+                )
 
 
 def _validate_local_model_cache(config: dict[str, Any]) -> None:
+    """Validate and normalize ephemeral node-local cache settings."""
     cache_dir = Path(_required_string(config, "local_model_cache_dir")).expanduser()
     if not cache_dir.is_absolute():
         raise ValueError("training_config.local_model_cache_dir must be absolute")
@@ -252,7 +280,9 @@ def load_training_config(
 
     for key in (
         "model_name",
+        "tokenizer_path",
         "model_source",
+        "source_model_uri",
         "local_model_cache_dir",
         "experiment_path",
         "mlflow_run_name",
@@ -279,12 +309,6 @@ def load_training_config(
             "experiment_name and training_config.experiment_path must match"
         )
     _validate_registered_model_name(config)
-    tokenizer_path = config.get("tokenizer_path")
-    if tokenizer_path is not None:
-        tokenizer_path = str(tokenizer_path).strip()
-        if not tokenizer_path:
-            raise ValueError("training_config.tokenizer_path must be null or non-empty")
-        config["tokenizer_path"] = tokenizer_path
     _validate_model_source(config)
     _validate_local_model_cache(config)
 

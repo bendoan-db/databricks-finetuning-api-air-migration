@@ -1,4 +1,4 @@
 interface:
   display_name: "AIR Migrate: Inspect FMT Model"
   short_description: "Recover legacy fine-tuning lineage"
-  default_prompt: "Use $air-migrate-inspect-fmt-model to inspect the configured legacy model and record its source, AIR compute, and execution policy in the migration manifest."
+  default_prompt: "Use $air-migrate-inspect-fmt-model to inspect the legacy model, record parameter-count evidence and peft_only, and resolve its configured Volume, system.ai, or Hugging Face training input without downloading weights."
